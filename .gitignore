@@ -1,0 +1,31 @@
+# Generated inventory and local output must never be published.
+reports/
+test-output/
+*.csv
+*.log
+*.xlsx
+*.zip
+*.clixml
+*.transcript*
+
+# Credentials, CLI state, and local configuration.
+.azure/
+.azd/
+.copilot/
+.env
+.env.*
+*.pem
+*.key
+*.pfx
+*.p12
+credentials*
+secrets*
+local.settings.json
+accessTokens.json
+msal_token_cache*
+
+# Editor and operating-system files.
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
