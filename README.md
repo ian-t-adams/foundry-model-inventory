@@ -132,8 +132,9 @@ CSV content is data from Azure, not executable content. When importing a report
 into spreadsheet software, treat text fields as text and do not enable external
 links or active content from untrusted input.
 
-Keep the repository private unless a separate publication review approves a
-visibility change. A code review is not a guarantee against all vulnerabilities.
+This public repository contains reusable code and synthetic tests only. Keep
+tenant-specific reports, logs and credentials private, and review every change
+before publishing. A code review is not a guarantee against all vulnerabilities.
 
 ## Offline tests
 
