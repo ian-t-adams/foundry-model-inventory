@@ -1111,7 +1111,13 @@ function selectTab(tab) {
 }
 
 function readSavedViews() {
-  const raw = localStorage.getItem(savedKey);
+  let raw;
+  try {
+    raw = localStorage.getItem(savedKey);
+  } catch {
+    toast("Saved views are unavailable because browser storage could not be accessed.", true);
+    return [];
+  }
   if (!raw) return [];
   try {
     const views = JSON.parse(raw);

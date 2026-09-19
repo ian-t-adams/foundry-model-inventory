@@ -46,6 +46,7 @@ Categorical filters are searchable, checkbox-based multi-selects: selections
 within a filter are matched with **OR**, and different filters combine with
 **AND**. Choose exactly one quota unit before entering a minimum, so a numeric
 threshold cannot silently mix TPM and PTUs. Saved views stay in your browser.
+Inventory browsing still works when browser storage is unavailable.
 Filtered CSV exports contain all matching deployment options, not only the
 visible page or grouped summary.
 
@@ -148,7 +149,9 @@ python -m dashboard collect
 ```
 
 Every command accepts `--data-dir` after its command name to use another local
-data directory. Keep that directory private and outside tracked source.
+directory under this checkout's ignored `data` directory, for example
+`--data-dir .\data\archive`. Paths outside `data` are rejected before any files
+are created. Keep all local data private and never force-add it to Git.
 
 ## Selected models and regions
 

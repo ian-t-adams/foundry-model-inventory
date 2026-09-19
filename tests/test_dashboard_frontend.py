@@ -90,6 +90,56 @@ assert.equal(blocked.data.theme, "dark");
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
+    @unittest.skipUnless(shutil.which("node"), "Node is optional; required only for this browser-logic unit test")
+    def test_saved_views_tolerate_unavailable_browser_storage(self):
+        script = r"""
+const fs = require("node:fs");
+const vm = require("node:vm");
+const assert = require("node:assert/strict");
+const source = fs.readFileSync(process.argv[1], "utf8")
+  .replace(/^import .*\r?\n/, "")
+  .replace(/\r?\nboot\(\);\s*$/, "");
+function setup(saved, blocked = false) {
+  const feedback = { hidden: true };
+  const context = {
+    document: { getElementById: (id) => { assert.equal(id, "toast"); return feedback; } },
+    localStorage: {
+      getItem: (key) => {
+        assert.equal(key, "foundry-inventory.saved-views.v1");
+        if (blocked) throw new Error("Access is denied.");
+        return saved;
+      },
+    },
+    setTimeout: () => 0,
+    clearTimeout: () => {},
+  };
+  vm.runInNewContext(source, context);
+  return { read: () => context.readSavedViews(), feedback };
+}
+const blocked = setup(null, true);
+assert.equal(blocked.read().length, 0);
+assert.equal(blocked.feedback.hidden, false);
+assert.equal(blocked.feedback.className, "toast error");
+assert.match(blocked.feedback.textContent, /browser storage/i);
+
+const empty = setup(null);
+assert.equal(empty.read().length, 0);
+assert.equal(empty.feedback.hidden, true);
+const saved = [{ name: "Example view", filters: { region: ["example-region"] }, view: "quota" }];
+const valid = setup(JSON.stringify(saved));
+assert.equal(JSON.stringify(valid.read()), JSON.stringify(saved));
+assert.equal(valid.feedback.hidden, true);
+const malformed = setup("{");
+assert.equal(malformed.read().length, 0);
+assert.equal(malformed.feedback.hidden, false);
+assert.match(malformed.feedback.textContent, /invalid list/i);
+"""
+        result = subprocess.run(
+            [shutil.which("node"), "-e", script, str(STATIC / "app.js")],
+            text=True, capture_output=True, timeout=30, check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

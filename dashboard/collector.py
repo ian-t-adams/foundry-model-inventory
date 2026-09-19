@@ -70,6 +70,14 @@ class StoreInterface(Protocol):
     def fail_scan(self, scan_id: int, message: str) -> None: ...
 
 
+def resolve_data_dir(repo_root: Path, data_dir: Path) -> Path:
+    """Validate the local data location without creating files or directories."""
+    resolved = Path(data_dir).resolve()
+    if not resolved.is_relative_to(Path(repo_root).resolve() / "data"):
+        raise ValueError("All local data must remain under the repository's data directory.")
+    return resolved
+
+
 def _utcnow() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -246,9 +254,7 @@ class Collector:
     def __init__(self, store: StoreInterface, repo_root: Path, data_dir: Path):
         self.store = store
         self.repo_root = Path(repo_root).resolve()
-        self.data_dir = Path(data_dir).resolve()
-        if not self.data_dir.is_relative_to(self.repo_root / "data"):
-            raise ValueError("All local data must remain under the repository's data directory.")
+        self.data_dir = resolve_data_dir(self.repo_root, data_dir)
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.config_path = self.data_dir / "config.json"
         self.status_path = self.data_dir / "collection-status.json"
