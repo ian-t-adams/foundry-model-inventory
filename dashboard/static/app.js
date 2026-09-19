@@ -3,11 +3,12 @@ import { MultiSelect, closeMultiSelects } from "./controls.js";
 const $ = (id) => document.getElementById(id);
 const multiKeys = ["subscription", "region", "family", "model", "model_version", "deployment_type",
   "capacity_type", "availability", "lifecycle", "unit"];
-const filterKeys = [...multiKeys, "version", "minimum"];
+const filterKeys = [...multiKeys, "version", "minimum", "quota_name", "sku"];
 const filterLabels = {
   subscription: "Subscription", region: "Region", family: "Family", model: "Model",
   model_version: "Model + version", version: "Legacy version", deployment_type: "Geography", capacity_type: "Capacity",
   availability: "Headroom", lifecycle: "Lifecycle", unit: "Unit", minimum: "Minimum",
+  quota_name: "Quota pool", sku: "SKU",
 };
 const defaultOptions = {
   subscription: "All subscriptions", region: "All regions", family: "All families",
@@ -16,12 +17,12 @@ const defaultOptions = {
   lifecycle: "All lifecycle states", unit: "All units",
 };
 const controls = new Map();
-const viewNames = { deployments: "deployment options", family: "families", model: "models", model_version: "model/version choices" };
+const viewNames = { quota: "quota entries", deployments: "catalog options", family: "families", model: "models", model_version: "model/version choices" };
 const state = {
-  filters: {}, snapshot: "latest", page: 1, pageSize: 50, sort: "model", direction: "asc",
+  filters: {}, snapshot: "latest", page: 1, pageSize: 50, sort: "remaining", direction: "desc",
   q: "", tab: "inventory", csrf: "", status: null, scans: [], rows: [],
   subscriptions: [], config: null, request: 0, compareRequest: 0, comparePage: 1, initialized: false,
-  facets: {}, view: "deployments", trail: [], chartVisible: true,
+  facets: {}, view: "quota", trail: [], chartVisible: true,
 };
 const numberFormat = new Intl.NumberFormat(undefined, { maximumFractionDigits: 3 });
 const dateFormat = new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
@@ -52,6 +53,11 @@ function when(value) {
 function selected(key) {
   const value = state.filters[key];
   return Array.isArray(value) ? value : value ? String(value).split(",").filter(Boolean) : [];
+}
+
+function resetSort() {
+  state.sort = state.view === "quota" ? "remaining" : state.view === "deployments" ? "model" : "label";
+  state.direction = state.view === "quota" ? "desc" : "asc";
 }
 
 function modelLabel(row) {
@@ -198,7 +204,7 @@ function readLocation() {
   state.filters = normalizeFilters(state.filters);
   $("inventory-search").value = state.q;
   $("table-view").value = state.view;
-  if (state.view !== "deployments") state.sort = "label";
+  resetSort();
   syncFilterControls();
 }
 
@@ -329,6 +335,7 @@ function changeFilter(key, values) {
 function renderFilterChips() {
   const fragment = document.createDocumentFragment();
   for (const key of filterKeys) {
+    if (key === "model" && selected("model_version").length) continue;
     const values = key === "minimum" ? (state.filters.minimum ? [state.filters.minimum] : []) : selected(key);
     const options = new Map((controls.get(key)?.allOptions() || []).map((option) => [option.value, option.label]));
     for (const value of values) {
@@ -371,7 +378,9 @@ function lifecycleLabel(value) {
 }
 
 function renderTableHeader() {
-  const columns = state.view === "deployments" ? [
+  const columns = state.view === "quota" ? [
+    ["Region / subscription", "region"], ["Deployment"], ["Quota allocation", "remaining"], ["Matching models"],
+  ] : state.view === "deployments" ? [
     ["Model + version", "model"], ["Subscription", "subscription"], ["Region", "region"],
     ["Deployment"], ["Capacity"], ["Remaining", "remaining", true], ["Lifecycle"],
   ] : state.view === "family" ? [
@@ -401,16 +410,23 @@ function renderTableHeader() {
     row.append(header);
   }
   $("inventory-head").replaceChildren(row);
-  document.querySelector(".inventory-table").classList.toggle("grouped-table", state.view !== "deployments");
+  document.querySelector(".inventory-table").classList.toggle("grouped-table", !["deployments", "quota"].includes(state.view));
+  document.querySelector(".inventory-table").classList.toggle("quota-table", state.view === "quota");
 }
 
 function renderInventorySummary(summary) {
+  $("inventory-summary").classList.toggle("quota-summary-mode", state.view === "quota");
   const choices = summaryItem(summary.versions, "model/version choices");
   choices.title = `${fmt(summary.models)} model names in this selection`;
-  $("inventory-summary").replaceChildren(
+  const quotaSummary = [
+    summaryItem(summary.with_headroom, "pools with quota", "quota-summary"),
+    summaryItem(summary.regions, "regions"), summaryItem(summary.subscriptions, "subscriptions"),
+  ];
+  if (summary.unknown_quota) quotaSummary.push(summaryItem(summary.unknown_quota, "unknown"));
+  $("inventory-summary").replaceChildren(...(state.view === "quota" ? quotaSummary : [
     choices, summaryItem(summary.regions, "regions"), summaryItem(summary.subscriptions, "subscriptions"),
     summaryItem(summary.with_headroom, "quota pools with headroom", "quota-summary"),
-  );
+  ]));
 }
 
 function finishTable(data) {
@@ -421,7 +437,14 @@ function finishTable(data) {
   $("previous-page").disabled = data.page <= 1;
   $("next-page").disabled = end >= data.total;
   $("export-button").disabled = !data.total;
-  $("export-button").title = "Export all matching deployment options, including their quota data.";
+  $("export-button").title = state.view === "quota" ? "Export each matching quota pool once." :
+    "Export all matching deployment options, including their quota data.";
+  $("quota-guide").hidden = state.view !== "quota";
+  $("quota-guide-text").textContent = data.snapshot ?
+    `Named pools shown once · snapshot ${when(data.snapshot.started_at)}` : "No quota snapshot yet";
+  $("inventory-footnote").textContent = state.view === "quota" ?
+    "Quota is not a deployment guarantee. Models share the amount shown; Azure capacity, lifecycle and access still need checking." :
+    "Catalog listings are not a deployment guarantee. Groups may share quota pools; do not add their quota counts.";
   $("last-update").textContent = data.snapshot ? `Snapshot: ${when(data.snapshot.started_at)}` : "No snapshot collected yet";
   closeDetail();
   renderFilterChips();
@@ -475,7 +498,157 @@ function renderInventory(data) {
   finishTable(data);
 }
 
+function barGraphic(parts) {
+  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  svg.setAttribute("viewBox", "0 0 200 12");
+  svg.setAttribute("preserveAspectRatio", "none");
+  svg.setAttribute("aria-hidden", "true");
+  const rectangle = (className, x, width) => {
+    const rect = document.createElementNS(svg.namespaceURI, "rect");
+    rect.setAttribute("x", String(x));
+    rect.setAttribute("width", String(width));
+    rect.setAttribute("height", "12");
+    rect.setAttribute("rx", "2");
+    rect.classList.add(className);
+    svg.append(rect);
+  };
+  rectangle("bar-track", 0, 200);
+  let offset = 0;
+  for (const part of parts) {
+    const width = Math.max(0, Math.min(200 - offset, part.share * 200));
+    rectangle(part.className, offset, width);
+    offset += width;
+  }
+  return svg;
+}
+
+function renderQuota(data) {
+  state.rows = data.rows;
+  renderTableHeader();
+  renderInventorySummary(data.summary);
+  const body = $("inventory-body");
+  body.replaceChildren();
+  if (!data.rows.length) {
+    const setup = el("button", "button primary", "Set up collection");
+    setup.type = "button";
+    setup.addEventListener("click", () => selectTab("collection"));
+    body.append(emptyRow(4, data.snapshot ? "No quota entries match this selection" : "Collect your first quota snapshot",
+      data.snapshot ? "Try another region, model or deployment type, or lower the minimum. Missing quota is never treated as zero." :
+        "Choose your subscriptions in Collection & history to see reported quota here.", data.snapshot ? null : setup));
+  }
+  for (const pool of data.rows) {
+    const row = el("tr");
+    const scope = el("td");
+    scope.append(el("strong", "scope-label", pool.region), el("span", "cell-secondary subscription-cell", pool.subscription));
+    const deployment = el("td");
+    deployment.append(el("span", "scope-label", pool.skus.filter(Boolean).join(", ") || "SKU not reported"),
+      el("span", "cell-secondary", `${pool.deployment_types.join(", ")} · ${pool.capacity_types.join(", ")}`));
+    const allocation = el("td", "allocation-cell");
+    const review = pool.availability === "available" && !pool.current_choices;
+    const status = review ? "Review lifecycle" : pool.availability === "available" ? "Quota available" :
+      pool.availability === "exhausted" ? pool.quota_limit === 0 ? "No quota assigned" : "Fully allocated" : "Quota unknown";
+    const heading = el("div", "allocation-heading");
+    heading.append(el("span", `quota-status ${review ? "review" : pool.availability}`, status));
+    if (pool.remaining !== null) {
+      heading.append(el("strong", "allocation-amount", `${fmt(pool.remaining)} ${pool.unit}`));
+      const limit = pool.quota_limit || 0;
+      allocation.append(heading, barGraphic([
+        { className: "bar-allocated", share: limit ? Math.min(1, pool.allocated / limit) : 0 },
+        { className: "bar-value", share: limit ? pool.remaining / limit : 0 },
+      ]), el("span", "cell-secondary", `${fmt(pool.allocated)} allocated · ${fmt(pool.quota_limit)} limit`));
+    } else {
+      allocation.append(heading, el("span", "cell-secondary", pool.unit === "Mixed" ? "Conflicting units; no amount inferred" : "Not reported consistently"));
+    }
+    const models = el("td", "pool-models");
+    const scopedModel = selected("model").length === 1 || selected("model_version").length === 1;
+    const label = pool.choices.length === 1 && !scopedModel ? pool.choices[0].label :
+      `${fmt(pool.choices.length)} matching ${pool.choices.length === 1 ? "choice" : "choices"}`;
+    const button = el("button", "group-button", label);
+    button.type = "button";
+    button.setAttribute("aria-label", `Review models using quota in ${pool.region}, ${pool.subscription}`);
+    button.addEventListener("click", () => openPoolDetail(pool, row));
+    models.append(button);
+    if (pool.sharing_choices > 1) {
+      models.append(el("span", "cell-secondary", `Shared by ${fmt(pool.sharing_choices)} catalog choices`));
+    } else if (pool.choices.length) {
+      models.append(el("span", "cell-secondary", pool.choices[0].lifecycles.map(lifecycleLabel).join(", ")));
+    }
+    row.append(scope, deployment, allocation, models);
+    body.append(row);
+  }
+  finishTable(data);
+}
+
+function openPoolDetail(pool, tableRow) {
+  closeDetail();
+  tableRow.classList.add("selected");
+  $("detail-title").textContent = "Quota pool";
+  $("row-detail").hidden = false;
+  $("data-workspace").classList.add("with-detail");
+  const content = $("detail-content");
+  content.replaceChildren(el("p", "detail-model", pool.region), el("p", "muted", pool.subscription));
+  content.append(el("p", "", pool.remaining === null ? "The available amount is unknown." :
+    `${fmt(pool.remaining)} ${pool.unit} unallocated out of a limit of ${fmt(pool.quota_limit)}.`));
+  if (pool.sharing_choices > 1) {
+    content.append(el("p", "muted", `This amount is shared by ${pool.sharing_choices} model/version choices in the snapshot. It is not a separate budget for each model.`));
+  }
+  if (pool.notes) content.append(el("p", "muted", pool.notes));
+  if (!pool.current_choices) content.append(el("p", "muted", "The matching entries need a lifecycle or SKU review before considering a deployment."));
+  const list = el("ul", "pool-choice-list");
+  for (const choice of pool.choices.slice(0, 8)) {
+    const item = el("li");
+    item.append(el("strong", "", choice.label),
+      el("span", "cell-secondary", `${choice.format} · ${choice.lifecycles.map(lifecycleLabel).join(", ")}`));
+    list.append(item);
+  }
+  content.append(el("h3", "", "Matching catalog choices"), list);
+  if (pool.choices.length > 8) content.append(el("p", "muted", `${fmt(pool.choices.length - 8)} more choices are available in the table.`));
+  const review = el("button", "button small", "Review matching models");
+  review.type = "button";
+  review.addEventListener("click", handled(async () => {
+    state.filters.subscription = [pool.subscription_id];
+    state.filters.region = [pool.region];
+    state.filters.quota_name = pool.quota_name ? [pool.quota_name] : [];
+    state.filters.sku = pool.skus.filter(Boolean);
+    if (!pool.quota_name) {
+      state.filters.model_version = pool.choices.map((choice) => choice.value);
+      state.filters.model = [...new Set(pool.choices.map((choice) => choice.model))];
+    }
+    state.view = "deployments";
+    state.page = 1;
+    resetSort();
+    $("table-view").value = state.view;
+    updateChoiceOptions();
+    syncFilterControls();
+    reconstructTrail();
+    await loadInventory();
+  }));
+  content.append(review, el("p", "muted", "Quota alone does not confirm Azure capacity, model access or deployment eligibility."));
+  const technical = el("details", "pool-technical");
+  technical.append(el("summary", "", "Pool identifier"), el("p", "muted", pool.quota_name || "Not reported"));
+  content.append(technical);
+  if (pool.choices.length === 1) content.append(pricingReference(pool.choices[0].model, pool.region));
+}
+
+function pricingReference(model, region) {
+  const section = el("details", "pool-technical");
+  section.append(el("summary", "", "Public unit pricing"));
+  const quoted = (value) => String(value).replaceAll("'", "''");
+  const filter = `serviceName eq 'Foundry Models' and armRegionName eq '${quoted(region)}' and priceType eq 'Consumption' and contains(meterName, '${quoted(model)}')`;
+  const parameters = new URLSearchParams({
+    "api-version": "2023-01-01-preview", currencyCode: "USD", $filter: filter,
+  });
+  const link = el("a", "", "Search published price meters");
+  link.href = `https://prices.azure.com/api/retail/prices?${parameters}`;
+  link.target = "_blank";
+  link.rel = "noopener noreferrer";
+  section.append(el("p", "muted", "Public rates include input, output and cache meters where published, with their original billing units. No usage data is required."), link,
+    el("p", "muted", "Search results may include other versions or fine-tuned SKUs. They are not verified prices for this selection or your negotiated rates. Quota is not a prepaid balance."));
+  return section;
+}
+
 function openDetail(row, tableRow) {
+  $("detail-title").textContent = "Model details";
   document.querySelectorAll(".inventory-table tr.selected").forEach((item) => item.classList.remove("selected"));
   tableRow.classList.add("selected");
   $("row-detail").hidden = false;
@@ -506,6 +679,7 @@ function openDetail(row, tableRow) {
     dl.append(el("dt", "", label), el("dd", "", value));
   }
   container.append(dl, el("p", "muted", "This quota pool may be shared with other models or versions. It is not capacity reserved for this row."));
+  container.append(pricingReference(row.model, row.region));
 }
 
 function closeDetail() {
@@ -518,8 +692,10 @@ async function loadInventory(reloadFacets = false) {
   const request = ++state.request;
   rememberLocation();
   const parameters = query();
-  if (state.view !== "deployments") parameters.set("group_by", state.view);
-  const dataPromise = api(`/api/${state.view === "deployments" ? "inventory" : "groups"}?${parameters}`);
+  const grouped = !["deployments", "quota"].includes(state.view);
+  if (grouped) parameters.set("group_by", state.view);
+  const endpoint = state.view === "quota" ? "quota" : grouped ? "groups" : "inventory";
+  const dataPromise = api(`/api/${endpoint}?${parameters}`);
   const facetsPromise = reloadFacets ? api(`/api/facets?snapshot=${encodeURIComponent(state.snapshot)}`) : Promise.resolve(null);
   const level = chartLevel();
   const chartParameters = query(false);
@@ -527,11 +703,12 @@ async function loadInventory(reloadFacets = false) {
   chartParameters.set("sort", level === "model_version" ? "regions" : "versions");
   chartParameters.set("direction", "desc");
   chartParameters.set("page_size", "12");
-  const chartPromise = state.chartVisible ? api(`/api/groups?${chartParameters}`) : Promise.resolve(null);
+  const chartPromise = state.chartVisible && state.view !== "quota" ? api(`/api/groups?${chartParameters}`) : Promise.resolve(null);
   const [data, facets, chart] = await Promise.all([dataPromise, facetsPromise, chartPromise]);
   if (request !== state.request) return;
   if (facets) renderFacets(facets);
-  if (state.view === "deployments") renderInventory(data);
+  if (state.view === "quota") renderQuota(data);
+  else if (state.view === "deployments") renderInventory(data);
   else renderGroups(data);
   renderChart(chart, level);
   coverageLoaded = false;
@@ -579,7 +756,8 @@ function chartLevel() {
 }
 
 function renderChart(data, level) {
-  $("model-chart").hidden = !state.chartVisible;
+  $("chart-toggle").hidden = state.view === "quota";
+  $("model-chart").hidden = !state.chartVisible || state.view === "quota";
   $("chart-toggle").textContent = state.chartVisible ? "Hide chart" : "Show chart";
   $("chart-toggle").setAttribute("aria-expanded", String(state.chartVisible));
   if (!data) return;
@@ -603,21 +781,7 @@ function renderChart(data, level) {
     button.setAttribute("aria-label", `Explore ${group.label}: ${group[metric]} ${metricLabel}`);
     button.title = `${group.label}: ${fmt(group[metric])} ${metricLabel}`;
     button.addEventListener("click", handled((event) => drillInto(group, level, event.detail === 0)));
-    const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
-    svg.setAttribute("viewBox", "0 0 200 12");
-    svg.setAttribute("preserveAspectRatio", "none");
-    svg.setAttribute("aria-hidden", "true");
-    const track = document.createElementNS(svg.namespaceURI, "rect");
-    track.setAttribute("width", "200");
-    track.setAttribute("height", "12");
-    track.setAttribute("rx", "2");
-    track.classList.add("bar-track");
-    const bar = document.createElementNS(svg.namespaceURI, "rect");
-    bar.setAttribute("width", String(200 * group[metric] / maximum));
-    bar.setAttribute("height", "12");
-    bar.setAttribute("rx", "2");
-    bar.classList.add("bar-value");
-    svg.append(track, bar);
+    const svg = barGraphic([{ className: "bar-value", share: group[metric] / maximum }]);
     button.append(el("span", "chart-label", group.label), svg, el("strong", "chart-count", fmt(group[metric])));
     container.append(button);
   }
@@ -650,9 +814,8 @@ async function drillInto(group, level, moveFocus = false) {
     state.filters.model = [group.filters.model_version[0][1]];
   }
   reconstructTrail();
-  state.view = level === "family" ? "model" : level === "model" ? "model_version" : "deployments";
-  state.sort = state.view === "deployments" ? "model" : "label";
-  state.direction = "asc";
+  state.view = level === "family" ? "model" : level === "model" ? "model_version" : "quota";
+  resetSort();
   state.page = 1;
   $("table-view").value = state.view;
   updateChoiceOptions();
@@ -665,7 +828,8 @@ function renderBreadcrumbs() {
   const container = $("drill-breadcrumbs");
   container.replaceChildren();
   if (!state.trail.length) {
-    container.append(el("span", "muted", state.view === "deployments" ? "Choose a bar or table view to explore." : "Select a row to drill down."));
+    container.append(el("span", "muted", state.view === "quota" ? "Select a model to find its quota." :
+      state.view === "deployments" ? "Select a model for details." : "Select a row to drill down."));
     return;
   }
   const all = el("button", "text-button", "All families");
@@ -974,7 +1138,7 @@ function renderSavedViews() {
       state.view = Object.hasOwn(viewNames, view.view) ? view.view : "deployments";
       state.chartVisible = view.chartVisible !== false;
       state.page = 1;
-      state.sort = state.view === "deployments" ? "model" : "label";
+      resetSort();
       reconstructTrail();
       $("table-view").value = state.view;
       $("inventory-search").value = state.q;
@@ -1071,8 +1235,7 @@ function wireEvents() {
   $("table-view").addEventListener("change", handled(async () => {
     state.view = $("table-view").value;
     state.page = 1;
-    state.sort = state.view === "deployments" ? "model" : "label";
-    state.direction = "asc";
+    resetSort();
     await loadInventory();
   }));
   $("chart-toggle").addEventListener("click", handled(async () => {
@@ -1098,7 +1261,8 @@ function wireEvents() {
     if (visible) controls.get("subscription").focus();
   });
   $("export-button").addEventListener("click", handled(async () => {
-    const response = await fetch(`/api/export.csv?${query(false)}`, { credentials: "same-origin", cache: "no-store" });
+    const endpoint = state.view === "quota" ? "/api/quota.csv" : "/api/export.csv";
+    const response = await fetch(`${endpoint}?${query(false)}`, { credentials: "same-origin", cache: "no-store" });
     if (!response.ok) {
       const failure = await response.json();
       throw new Error(failure.error || "CSV export failed.");
@@ -1106,7 +1270,7 @@ function wireEvents() {
     const objectUrl = URL.createObjectURL(await response.blob());
     const link = el("a");
     link.href = objectUrl;
-    link.download = `foundry-inventory-${state.snapshot}.csv`;
+    link.download = `foundry-${state.view === "quota" ? "quota" : "inventory"}-${state.snapshot}.csv`;
     link.click();
     setTimeout(() => URL.revokeObjectURL(objectUrl), 1000);
     toast("Filtered CSV downloaded.");

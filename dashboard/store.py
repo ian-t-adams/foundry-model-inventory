@@ -61,6 +61,8 @@ _FILTER_COLUMNS = {
     "capacity_type": "capacity_type",
     "lifecycle": "lifecycle",
     "unit": "unit",
+    "quota_name": "quota_name",
+    "sku": "sku",
 }
 CATEGORICAL_FILTERS = frozenset(_FILTER_COLUMNS) | {"availability"}
 MAX_FILTER_ITEMS = 256
@@ -83,6 +85,13 @@ _VARIANT_LABEL_SQL = (
     "model || ' ' || CASE WHEN version='' THEN '(version not reported)' ELSE version END"
 )
 _FAMILY_SQL = "CASE WHEN family COLLATE NOCASE='Mistral AI' THEN 'Mistral' ELSE family END"
+_POOL_KEY_SQL = "CASE WHEN quota_name='' THEN 'entry:' || key ELSE 'pool:' || quota_name END"
+_POOL_KNOWN_SQL = """
+    MIN(CASE WHEN quota_status='Reported' AND quota_limit IS NOT NULL
+             AND allocated IS NOT NULL AND remaining IS NOT NULL THEN 1 ELSE 0 END)
+    AND COUNT(DISTINCT quota_limit)=1 AND COUNT(DISTINCT allocated)=1
+    AND COUNT(DISTINCT remaining)=1 AND COUNT(DISTINCT unit)=1
+"""
 _ENUMS = {
     "deployment_type": {"Global", "DataZone", "Regional", "Unknown"},
     "capacity_type": {"PAYG", "PTU", "Batch", "Other"},
@@ -925,11 +934,7 @@ class Store:
             ),
             pools AS (
                 SELECT {prefix}subscription_id,region,quota_name,
-                    MIN(CASE WHEN quota_status='Reported' AND quota_limit IS NOT NULL
-                             AND allocated IS NOT NULL AND remaining IS NOT NULL
-                             THEN 1 ELSE 0 END)
-                    AND COUNT(DISTINCT quota_limit)=1 AND COUNT(DISTINCT allocated)=1
-                    AND COUNT(DISTINCT remaining)=1 AND COUNT(DISTINCT unit)=1 AS known,
+                    {_POOL_KNOWN_SQL} AS known,
                     MIN(remaining) AS remaining
                 FROM selected WHERE quota_name!=''
                 GROUP BY {prefix}subscription_id,region,quota_name
@@ -1018,6 +1023,146 @@ class Store:
                     rows.append(row)
             return dict(rows=rows, total=total, page=filters["page"], page_size=filters["page_size"],
                         snapshot=snapshot, group_by=group_by, summary=summary)
+
+    def quota(self, filters: dict) -> dict:
+        """Show each quota pool once; model filters cannot hide conflicting readings."""
+        return self._quota_result(filters)
+
+    def _quota_result(self, filters: dict, *, paginate: bool = True) -> dict:
+        requested = filters or {}
+        selected = self._filters(filters)
+        selected["sort"] = requested.get("sort") or "remaining"
+        selected["direction"] = requested.get("direction") or "desc"
+        if selected["sort"] not in {"remaining", "allocated", "quota_limit", "region", "subscription", "unit"}:
+            raise ValueError("Unsupported quota sort column.")
+        scope = {**selected, "availability": [], "minimum": None}
+        rows = []
+        with self._transaction() as db:
+            snapshot = self._snapshot(db, selected["snapshot"])
+            if snapshot is not None:
+                where, parameters = self._where(snapshot["id"], scope)
+                query = f"""
+                    WITH selected AS (
+                        SELECT *,{_POOL_KEY_SQL} AS pool_key FROM inventory WHERE {where}
+                    ), matches AS (
+                        SELECT subscription_id,region,pool_key,MIN(subscription) AS subscription,
+                            COUNT(*) AS matching_entries,
+                            json_group_array(DISTINCT json_array(
+                                format,model,version,family,lifecycle,catalog,sku
+                            )) AS choices_json,
+                            json_group_array(DISTINCT sku) AS skus_json,
+                            json_group_array(DISTINCT deployment_type) AS types_json,
+                            json_group_array(DISTINCT capacity_type) AS capacities_json
+                        FROM selected GROUP BY subscription_id,region,pool_key
+                    ), readings AS (
+                        SELECT *,{_POOL_KEY_SQL} AS pool_key FROM inventory WHERE scan_id=?
+                    ), pools AS (
+                        SELECT subscription_id,region,pool_key,MIN(quota_name) AS quota_name,
+                            {_POOL_KNOWN_SQL} AND MIN(unit!='') AS known,
+                            MIN(quota_limit) AS quota_limit,MIN(allocated) AS allocated,
+                            MIN(remaining) AS remaining,
+                            json_group_array(DISTINCT unit) AS units_json,
+                            COUNT(DISTINCT json_array(format,model,version)) AS sharing_choices,
+                            SUM(CASE WHEN quota_status='ERROR' THEN 1 ELSE 0 END) AS errors
+                        FROM readings JOIN matches USING(subscription_id,region,pool_key)
+                        GROUP BY subscription_id,region,pool_key
+                    )
+                    SELECT pools.*,matches.subscription,matches.matching_entries,matches.choices_json,
+                        matches.skus_json,matches.types_json,matches.capacities_json
+                    FROM pools JOIN matches USING(subscription_id,region,pool_key)
+                """
+                for raw in db.execute(query, [*parameters, snapshot["id"]]):
+                    known = bool(raw["known"] and raw["quota_name"])
+                    availability = ("available" if raw["remaining"] > 0 else "exhausted") if known else "unknown"
+                    if selected["availability"] and availability not in selected["availability"]:
+                        continue
+                    if selected["minimum"] is not None and (not known or raw["remaining"] < selected["minimum"]):
+                        continue
+                    choices = {}
+                    for provider, model, version, family, lifecycle, catalog, sku in json.loads(raw["choices_json"]):
+                        key = (provider, model, version)
+                        if key not in choices:
+                            choices[key] = {**_variant_option(provider, model, version, family),
+                                            "lifecycles": set(), "catalogs": set()}
+                        choices[key]["lifecycles"].add(lifecycle or "Not reported")
+                        choices[key]["catalogs"].add(catalog)
+                    for choice in choices.values():
+                        choice["lifecycles"] = sorted(choice["lifecycles"])
+                        choice["catalogs"] = sorted(choice["catalogs"])
+                    units = sorted(unit for unit in json.loads(raw["units_json"]) if unit)
+                    note = ""
+                    if not raw["quota_name"]:
+                        note = "No quota pool was reported. This entry cannot be combined with other unknown entries."
+                    elif not known:
+                        note = "Pool readings are incomplete or inconsistent; no quota amount is inferred."
+                    current = sum(
+                        "Listed" in choice["catalogs"] and bool(
+                            {"GenerallyAvailable", "Stable", "Preview"} & set(choice["lifecycles"])
+                        ) for choice in choices.values()
+                    )
+                    rows.append({
+                        "key": _json([raw["subscription_id"], raw["region"], raw["pool_key"]]),
+                        "subscription_id": raw["subscription_id"], "subscription": raw["subscription"],
+                        "region": raw["region"], "quota_name": raw["quota_name"],
+                        "quota_limit": raw["quota_limit"] if known else None,
+                        "allocated": raw["allocated"] if known else None,
+                        "remaining": raw["remaining"] if known else None,
+                        "unit": units[0] if len(units) == 1 else "Mixed" if units else "",
+                        "availability": availability, "notes": note,
+                        "skus": sorted(json.loads(raw["skus_json"])),
+                        "deployment_types": sorted(json.loads(raw["types_json"])),
+                        "capacity_types": sorted(json.loads(raw["capacities_json"])),
+                        "choices": sorted(choices.values(), key=lambda choice: (choice["label"].casefold(), choice["format"])),
+                        "sharing_choices": raw["sharing_choices"], "current_choices": current,
+                        "matching_entries": raw["matching_entries"],
+                    })
+
+            variants = {(choice["format"], choice["model"], choice["version"])
+                        for row in rows for choice in row["choices"]}
+            summary = {
+                "models": len({(provider, model) for provider, model, version in variants}),
+                "versions": len(variants), "regions": len({row["region"] for row in rows}),
+                "subscriptions": len({row["subscription_id"] for row in rows}),
+                "rows": sum(row["matching_entries"] for row in rows),
+                "quota_pools": sum(bool(row["quota_name"]) for row in rows),
+                "with_headroom": sum(row["availability"] == "available" for row in rows),
+                "zero_quota": sum(row["availability"] == "exhausted" for row in rows),
+                "unknown_quota": sum(row["availability"] == "unknown" for row in rows),
+            }
+            column, descending = selected["sort"], selected["direction"] == "desc"
+            rows.sort(key=lambda row: (row["region"].casefold(), row["subscription"].casefold(), row["key"]))
+            if column in _NUMERIC_FIELDS:
+                rows.sort(key=lambda row: (
+                    row[column] is None,
+                    (-row[column] if descending else row[column]) if row[column] is not None else 0,
+                ))
+                rows.sort(key=lambda row: row["unit"].casefold())
+            else:
+                rows.sort(key=lambda row: row[column].casefold(), reverse=descending)
+            ranks = {"available": 0, "exhausted": 2, "unknown": 3}
+            rows.sort(key=lambda row: 1 if row["availability"] == "available" and not row["current_choices"]
+                      else ranks[row["availability"]])
+            total = len(rows)
+            if paginate:
+                start = (selected["page"] - 1) * selected["page_size"]
+                rows = rows[start:start + selected["page_size"]]
+            return dict(rows=rows, total=total, page=selected["page"], page_size=selected["page_size"],
+                        snapshot=snapshot, summary=summary)
+
+    def export_quota_csv(self, filters: dict) -> str:
+        result = self._quota_result(filters, paginate=False)
+        fields = ("subscription", "subscription_id", "region", "quota_name", "unit",
+                  "quota_limit", "allocated", "remaining", "availability", "sharing_choices",
+                  "matching_model_versions", "skus", "notes")
+        output = io.StringIO(newline="")
+        writer = csv.DictWriter(output, fieldnames=fields)
+        writer.writeheader()
+        for row in result["rows"]:
+            record = {key: row.get(key, "") for key in fields}
+            record["matching_model_versions"] = "; ".join(choice["label"] for choice in row["choices"])
+            record["skus"] = "; ".join(row["skus"])
+            writer.writerow({key: _spreadsheet(value) for key, value in record.items()})
+        return output.getvalue()
 
     def facets(self, snapshot: str | int = "latest") -> dict:
         with self._transaction() as db:

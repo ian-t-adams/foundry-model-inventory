@@ -709,6 +709,21 @@ class ServerTests(unittest.TestCase):
         (self.static / "arbitrary.js").write_text("must not be served", encoding="utf-8")
         self.assert_json_error(self.request("GET", "/arbitrary.js"), 404)
 
+    def test_quota_routes_deduplicate_and_preserve_security_boundaries(self):
+        self.ingest()
+        status, headers, body = self.request("GET", "/api/quota?page_size=1")
+        self.assertEqual(status, 200)
+        result = json.loads(body)
+        self.assertEqual(result["total"], 1)
+        self.assertEqual(result["rows"][0]["remaining"], 7)
+        self.assertEqual(result["rows"][0]["sharing_choices"], 2)
+        status, headers, body = self.request("GET", "/api/quota.csv?page_size=1")
+        self.assertEqual(status, 200)
+        self.assertIn("foundry-quota.csv", headers["Content-Disposition"])
+        self.assertEqual(len(list(csv.DictReader(io.StringIO(body.decode())))), 1)
+        self.assert_json_error(self.request("GET", "/api/quota", headers={"Origin": "https://example.invalid"}), 403)
+        self.assert_json_error(self.request("GET", "/api/quota?sort=unsupported"), 400)
+
 
 if __name__ == "__main__":
     unittest.main()

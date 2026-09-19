@@ -32,7 +32,8 @@ From that checkout:
 
 Open **http://127.0.0.1:8765**. The server binds to loopback only and runs in the
 foreground until you press Ctrl+C. Use `-Port` to choose another local port.
-There are no external fonts, CDNs, analytics, or browser calls to Azure.
+There are no external fonts, CDNs, analytics, or automatic browser calls to
+Azure. Public pricing references are opened only when you choose their link.
 
 In **Collection & history**, discover the subscriptions from your existing Azure
 CLI sign-in, choose one tenant and the subscriptions to collect, and save the
@@ -58,13 +59,28 @@ Model/version choices remain paired internally and in the table. Selecting
 model A/version 1 and model B/version 2 does not also select A/2 or B/1. Existing
 links and saved views with paired selections restore their parent models.
 
-Use **Table view** to browse model families, models, model/version choices, or
+Use **View** to browse model families, models, model/version choices, or
 detailed deployment options. Select a table row or chart bar to drill from
 family to model to version and then to the matching regional/subscription
 options. Breadcrumbs return to a broader level while retaining your other
 scope filters. The bar chart counts distinct catalog model/version choices
 or regions, not a sum of incompatible quota units. **Hide chart** restores a
 more compact table view.
+
+The default **Quota pools** view answers where quota is reported available.
+Each named subscription/region/quota pool appears once, with an inline
+allocated-versus-available bar and its original unit. Shared pools identify how
+many catalog choices use the same allocation; choosing one model does not
+invent a separate budget for it. Conflicting pool readings remain unknown even
+if the conflicting model is outside the current filter. Unmapped entries remain
+separate because their pool identity is not known.
+
+Quota is ranked by availability, with amounts grouped by unit rather than
+comparing PTUs to TPM. Rows whose matching catalog choices all need lifecycle or
+SKU review are labeled accordingly. **Review matching models** opens the
+existing catalog drill-down. Export from this view also emits each matching
+pool once. Catalog views remain available in the same View selector; no second
+quota chart repeats the table's amounts.
 
 The **System / Light / Dark** control follows the operating-system preference
 by default. An explicit choice is saved in this browser and applies to every
@@ -243,6 +259,13 @@ do not force-add output, and review `git diff --cached` before publishing change
 
 The optional retail-price request sends catalog billing-meter IDs to the public
 Azure pricing API. It does not send your Azure access token to that API.
+
+Model details also include a **Public unit pricing** reference to the Retail
+Prices API. This API provides raw per-unit list rates independently of Cost
+Management usage/spend data. The link sends only the public model name and region,
+not tenant identifiers or credentials. Its meter search is explicitly unverified:
+names can include other versions, regional/global types or fine-tuned variants.
+The dashboard does not guess input/output/cache prices from those matches.
 
 The dashboard serves only its fixed static assets and API routes, never the
 database, configuration files or arbitrary local paths. Collection and schedule

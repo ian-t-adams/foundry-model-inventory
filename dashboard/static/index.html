@@ -82,7 +82,7 @@ FORM: Instrument workbench, grounded direction 6, seed 247d456d. Historical stat
         <progress id="scan-progress-bar" aria-label="Subscription collection progress" max="1" value="0"></progress>
       </section>
       <div class="page-heading">
-        <div><h1>Your model estate</h1><p id="page-description">Catalog, quota, and change over time. One local workspace.</p></div>
+        <div><h1>Your model estate</h1><p id="page-description">Find quota. Explore models. See what changed.</p></div>
         <label class="snapshot-picker">Snapshot<select id="snapshot-select"><option value="latest">Latest complete snapshot</option></select></label>
       </div>
       <nav class="section-nav" aria-label="Workspace sections">
@@ -106,12 +106,16 @@ FORM: Instrument workbench, grounded direction 6, seed 247d456d. Historical stat
         </div>
         <div id="active-filters" class="active-filters" aria-label="Active filters"></div>
         <div class="explorer-toolbar">
-          <label>Table view<select id="table-view">
-            <option value="deployments">Deployment options</option><option value="family">Model families</option>
+          <label>View<select id="table-view">
+            <option value="quota">Quota pools</option><option value="deployments">Catalog options</option><option value="family">Model families</option>
             <option value="model">Models</option><option value="model_version">Model + version</option>
           </select></label>
           <nav id="drill-breadcrumbs" class="drill-breadcrumbs" aria-label="Model exploration"></nav>
           <button id="chart-toggle" type="button" class="text-button" aria-expanded="true" aria-controls="model-chart">Hide chart</button>
+        </div>
+        <div id="quota-guide" class="quota-guide" hidden>
+          <span id="quota-guide-text">Quota available first. Each named pool appears once.</span>
+          <span class="allocation-legend"><span class="legend-allocated"></span>Allocated <span class="legend-available"></span>Available</span>
         </div>
         <figure id="model-chart" class="model-chart" aria-labelledby="chart-title">
           <div class="chart-heading"><h2 id="chart-title">Model/version choices by family</h2><span id="chart-scale" class="muted"></span></div>
@@ -149,7 +153,7 @@ FORM: Instrument workbench, grounded direction 6, seed 247d456d. Historical stat
             <div id="detail-content"></div>
           </aside>
         </div>
-        <p class="data-footnote"><strong>Quota is not a capacity guarantee.</strong> Pools are counted once within each selection or group. Groups can share a pool, so their quota counts must not be summed. Different units are never added.</p>
+        <p id="inventory-footnote" class="data-footnote">Quota is not a deployment guarantee. Shared pools are not separate budgets for every model.</p>
       </section>
       <section id="panel-changes" class="section-panel" aria-labelledby="changes-title" hidden>
         <div class="section-heading"><div><h2 id="changes-title">What changed?</h2><p>Compare the same observed scope. Your inventory filters also apply here.</p></div></div>

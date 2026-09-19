@@ -30,6 +30,12 @@ and the inventory table. A compact, clickable bar chart and grouped table views
 expose family -> model -> model/version -> deployment options. Breadcrumbs
 retain non-model scope filters. Model details open alongside or below the table.
 
+Quota pools are the default working view. One row represents one named
+subscription/region/pool allocation, not one budget per model version. Inline
+allocated/available bars replace the separate catalog-count chart in this view.
+Amounts keep their units, positive quota is distinct from deployability, and
+pool sharing and lifecycle review are visible without another dashboard page.
+
 Narrow screens collapse the rail behind a Filters control. Tables scroll
 horizontally inside their own labeled region without overflowing the page.
 Settings become one column; typography stays readable rather than shrinking.

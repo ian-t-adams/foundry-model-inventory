@@ -49,6 +49,7 @@ _SECURITY_HEADERS = {
 _GET_ROUTES = {
     "/api/status", "/api/scans", "/api/inventory", "/api/facets", "/api/coverage",
     "/api/compare", "/api/history", "/api/export.csv", "/api/subscriptions", "/api/groups",
+    "/api/quota", "/api/quota.csv",
 }
 _POST_ROUTES = {"/api/config", "/api/scan", "/api/schedule"}
 
@@ -300,6 +301,8 @@ class _Handler(BaseHTTPRequestHandler):
             result = store.inventory(parameters)
         elif path == "/api/groups":
             result = store.groups(parameters)
+        elif path == "/api/quota":
+            result = store.quota(parameters)
         elif path == "/api/facets":
             result = store.facets(parameters.get("snapshot", "latest"))
         elif path == "/api/coverage":
@@ -310,10 +313,13 @@ class _Handler(BaseHTTPRequestHandler):
             if "from" not in parameters or "to" not in parameters:
                 raise _HTTPError(400, "Comparison requires from and to snapshot IDs.")
             result = store.compare(parameters.pop("from"), parameters.pop("to"), parameters)
-        elif path == "/api/export.csv":
+        elif path in {"/api/export.csv", "/api/quota.csv"}:
+            quota_export = path == "/api/quota.csv"
+            content = store.export_quota_csv(parameters) if quota_export else store.export_csv(parameters)
+            filename = "foundry-quota.csv" if quota_export else "foundry-inventory.csv"
             self._respond(
-                200, store.export_csv(parameters).encode("utf-8"), "text/csv; charset=utf-8",
-                {"Content-Disposition": 'attachment; filename="foundry-inventory.csv"'},
+                200, content.encode("utf-8"), "text/csv; charset=utf-8",
+                {"Content-Disposition": f'attachment; filename="{filename}"'},
             )
             return
         else:
