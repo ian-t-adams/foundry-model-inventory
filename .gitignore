@@ -7,6 +7,15 @@ test-output/
 *.zip
 *.clixml
 *.transcript*
+data/
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.sqlite3-*
+__pycache__/
+*.py[cod]
+.pytest_cache/
 
 # Credentials, CLI state, and local configuration.
 .azure/
@@ -29,3 +38,4 @@ msal_token_cache*
 .idea/
 Thumbs.db
 .DS_Store
+.impeccable/

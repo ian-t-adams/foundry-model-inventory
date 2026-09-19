@@ -1,0 +1,220 @@
+<!doctype html>
+<html lang="en">
+<!--
+THESIS: A local inventory workbench, not a wall of totals; every result retains its scope and unit.
+OWN-WORLD: Ink-blue navigation, cool daylight surfaces, teal actions, measured system type and ruled tables.
+STORY: Choose a snapshot, narrow the estate, inspect quota, and compare the same scope over time.
+FIRST VIEWPORT: Slim app bar, persistent filter rail, snapshot control and a broad data table; collect at upper right.
+FORM: Instrument workbench, grounded direction 6, seed 247d456d. Historical states are exposed alongside current data.
+-->
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>Foundry inventory — local workbench</title>
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <script src="/theme.js"></script>
+  <link rel="stylesheet" href="/styles.css">
+  <script src="/app.js" type="module"></script>
+</head>
+<body>
+  <a class="skip-link" href="#main-content">Skip to inventory</a>
+  <header class="app-bar">
+    <a class="brand" href="#inventory" aria-label="Foundry inventory home">
+      <svg class="brand-mark" viewBox="0 0 28 28" aria-hidden="true">
+        <path d="M4 4h8v8H4zM16 4h8v8h-8zM4 16h8v8H4z" fill="currentColor"/>
+        <path d="M16 16h8v8h-8z" fill="none" stroke="currentColor" stroke-width="2"/>
+      </svg>
+      <span><span class="brand-product">Foundry </span><strong>inventory</strong></span>
+    </a>
+    <div class="local-label"><span class="status-dot" aria-hidden="true"></span>Local workspace</div>
+    <div class="app-actions">
+      <span id="scan-state" class="scan-state">Connecting…</span>
+      <label class="appearance-control"><span class="sr-only">Appearance</span><select id="appearance-select" aria-label="Appearance"><option value="system">System</option><option value="light">Light</option><option value="dark">Dark</option></select></label>
+      <button id="scan-button" class="button primary" type="button">
+        <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M16.4 6.5A7 7 0 1 0 17 12M16.5 2.5v4.8h-4.8" /></svg>
+        <span>Collect now</span>
+      </button>
+    </div>
+  </header>
+  <div class="workspace">
+    <aside class="filter-rail" aria-label="Inventory filters">
+      <div class="rail-heading">
+        <h2>Filter your estate</h2>
+        <button id="reset-filters" class="text-button" type="button">Reset</button>
+      </div>
+      <p class="rail-description">Choose any combination. Selections within a filter are matched with “or”.</p>
+      <form id="filters-form" class="filter-form">
+        <div id="filter-subscription"></div>
+        <div id="filter-region"></div>
+        <div id="filter-family"></div>
+        <div id="filter-model"></div>
+        <div id="filter-model_version"></div>
+        <div class="filter-separator"></div>
+        <div id="filter-deployment_type"></div>
+        <div id="filter-capacity_type"></div>
+        <div id="filter-availability"></div>
+        <details class="advanced-filters">
+          <summary>More filters</summary>
+          <div id="filter-lifecycle"></div>
+          <div id="filter-unit"></div>
+          <label>Minimum remaining<input id="filter-minimum" name="minimum" type="number" min="0" step="any" placeholder="Select exactly one unit" disabled></label>
+        </details>
+      </form>
+      <section class="saved-views" aria-labelledby="saved-views-title">
+        <h3 id="saved-views-title">Saved views</h3>
+        <div id="saved-view-list" class="saved-view-list"><p class="muted">Keep a useful set of filters here.</p></div>
+        <details id="save-view-details">
+          <summary>Save these filters</summary>
+          <form id="save-view-form">
+            <label class="sr-only" for="saved-view-name">View name</label>
+            <input id="saved-view-name" maxlength="50" placeholder="For example: EU PAYG" required>
+            <button class="button small" type="submit">Save view</button>
+          </form>
+        </details>
+      </section>
+      <p class="local-note">Data stays on this computer.<br>No cloud database or telemetry.</p>
+    </aside>
+    <main id="main-content" class="main-content" tabindex="-1">
+      <div id="notice" class="notice" role="status" hidden></div>
+      <section id="scan-progress" class="scan-progress" aria-live="polite" hidden>
+        <div><strong id="scan-progress-title">Collecting your estate</strong><p id="scan-progress-message">Contacting Azure…</p></div>
+        <progress id="scan-progress-bar" aria-label="Subscription collection progress" max="1" value="0"></progress>
+      </section>
+      <div class="page-heading">
+        <div><h1>Your model estate</h1><p id="page-description">Catalog, quota, and change over time. One local workspace.</p></div>
+        <label class="snapshot-picker">Snapshot<select id="snapshot-select"><option value="latest">Latest complete snapshot</option></select></label>
+      </div>
+      <nav class="section-nav" aria-label="Workspace sections">
+        <button type="button" class="section-tab active" data-tab="inventory" aria-current="page">Inventory</button>
+        <button type="button" class="section-tab" data-tab="changes">Changes</button>
+        <button type="button" class="section-tab" data-tab="collection">Collection &amp; history</button>
+      </nav>
+      <section id="panel-inventory" class="section-panel" aria-label="Model inventory">
+        <div class="inventory-summary" id="inventory-summary" aria-live="polite">
+          <span class="skeleton summary-skeleton"></span><span class="skeleton summary-skeleton"></span>
+          <span class="skeleton summary-skeleton"></span>
+        </div>
+        <div class="inventory-toolbar">
+          <label class="search-field">
+            <svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="8.4" cy="8.4" r="5.5"/><path d="m12.5 12.5 4 4"/></svg>
+            <span class="sr-only">Search inventory</span>
+            <input type="search" id="inventory-search" placeholder="Search models, regions, or SKUs" autocomplete="off">
+          </label>
+          <button id="export-button" class="button" type="button">Export filtered CSV</button>
+          <button id="mobile-filters" class="button mobile-only" type="button" aria-expanded="false">Filters</button>
+        </div>
+        <div id="active-filters" class="active-filters" aria-label="Active filters"></div>
+        <div class="explorer-toolbar">
+          <label>Table view<select id="table-view">
+            <option value="deployments">Deployment options</option><option value="family">Model families</option>
+            <option value="model">Models</option><option value="model_version">Model + version</option>
+          </select></label>
+          <nav id="drill-breadcrumbs" class="drill-breadcrumbs" aria-label="Model exploration"></nav>
+          <button id="chart-toggle" type="button" class="text-button" aria-expanded="true" aria-controls="model-chart">Hide chart</button>
+        </div>
+        <figure id="model-chart" class="model-chart" aria-labelledby="chart-title">
+          <div class="chart-heading"><h2 id="chart-title">Model/version choices by family</h2><span id="chart-scale" class="muted"></span></div>
+          <div id="chart-bars" class="chart-bars"><span class="skeleton"></span><span class="skeleton"></span></div>
+          <figcaption id="chart-caption">Select a bar to drill into the table. Repeated regions and subscriptions are counted once per model/version choice.</figcaption>
+        </figure>
+        <p class="mobile-table-hint">Scroll the table for deployment and quota details.</p>
+        <div class="data-workspace" id="data-workspace">
+          <div class="data-table-section">
+            <div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable inventory table">
+              <table class="inventory-table">
+                <thead id="inventory-head"><tr>
+                  <th scope="col" data-sort="model" aria-sort="ascending"><button type="button">Model + version <span aria-hidden="true">↑</span></button></th>
+                  <th scope="col" data-sort="subscription"><button type="button">Subscription <span aria-hidden="true"></span></button></th>
+                  <th scope="col" data-sort="region"><button type="button">Region <span aria-hidden="true"></span></button></th>
+                  <th scope="col">Deployment</th><th scope="col">Capacity</th>
+                  <th scope="col" data-sort="remaining" class="number-cell"><button type="button">Remaining <span aria-hidden="true"></span></button></th>
+                  <th scope="col">Lifecycle</th>
+                </tr></thead>
+                <tbody id="inventory-body"><tr><td colspan="7"><div class="table-loading"><span class="skeleton"></span><span class="skeleton"></span><span class="skeleton"></span><span class="skeleton"></span></div></td></tr></tbody>
+              </table>
+            </div>
+            <div class="pagination">
+              <p id="result-count" aria-live="polite">Loading inventory…</p>
+              <div class="page-controls">
+                <label>Rows<select id="page-size"><option>25</option><option selected>50</option><option>100</option></select></label>
+                <button id="previous-page" class="button small" type="button" disabled>Previous</button>
+                <span id="page-number">1</span>
+                <button id="next-page" class="button small" type="button" disabled>Next</button>
+              </div>
+            </div>
+          </div>
+          <aside id="row-detail" class="row-detail" aria-labelledby="detail-title" hidden>
+            <div class="detail-heading"><h2 id="detail-title">Model details</h2><button id="close-detail" class="icon-button" aria-label="Close model details" type="button">×</button></div>
+            <div id="detail-content"></div>
+          </aside>
+        </div>
+        <p class="data-footnote"><strong>Quota is not a capacity guarantee.</strong> Pools are counted once within each selection or group. Groups can share a pool, so their quota counts must not be summed. Different units are never added.</p>
+      </section>
+      <section id="panel-changes" class="section-panel" aria-labelledby="changes-title" hidden>
+        <div class="section-heading"><div><h2 id="changes-title">What changed?</h2><p>Compare the same observed scope. Your inventory filters also apply here.</p></div></div>
+        <form id="compare-form" class="compare-controls">
+          <label>From snapshot<select id="compare-from" required></select></label>
+          <span class="compare-arrow" aria-hidden="true">→</span>
+          <label>To snapshot<select id="compare-to" required></select></label>
+          <button class="button primary" type="submit">Compare snapshots</button>
+        </form>
+        <div id="compare-summary" class="inventory-summary"></div>
+        <div id="compare-warnings" class="notice warning" hidden></div>
+        <div class="table-scroll" tabindex="0" role="region" aria-label="Snapshot differences">
+          <table><thead><tr><th>Change</th><th>Model + version</th><th>Subscription / region</th><th>Deployment</th><th>Before → after</th></tr></thead>
+          <tbody id="compare-body"><tr><td colspan="5" class="empty-cell"><h3>A history worth keeping</h3><p>Collect or import two snapshots to see new models, removed entries, and quota changes.</p></td></tr></tbody></table>
+        </div>
+        <div class="pagination" id="compare-pagination" hidden>
+          <p id="compare-count" aria-live="polite"></p>
+          <div class="page-controls">
+            <button id="compare-previous" class="button small" type="button" disabled>Previous</button>
+            <span id="compare-page-number"></span>
+            <button id="compare-next" class="button small" type="button" disabled>Next</button>
+          </div>
+        </div>
+      </section>
+      <section id="panel-collection" class="section-panel" aria-labelledby="collection-title" hidden>
+        <div class="section-heading"><div><h2 id="collection-title">Collection &amp; history</h2><p>Read-only Azure inventory. Every collection is kept as a dated snapshot.</p></div></div>
+        <div class="collection-layout">
+          <section class="settings-section" aria-labelledby="scope-title">
+            <div class="section-heading compact"><h3 id="scope-title">Collection scope</h3><button id="discover-button" class="button small" type="button">Discover subscriptions</button></div>
+            <p class="muted">Uses the subscriptions available to your current Azure CLI sign-in.</p>
+            <form id="config-form">
+              <label>Tenant<select id="tenant-select"><option value="">Discover or load a tenant</option></select></label>
+              <fieldset class="subscription-picker"><legend>Subscriptions to collect</legend><div id="subscription-choices"><p class="muted">No collection scope configured.</p></div></fieldset>
+              <button class="button primary" type="submit">Save collection scope</button>
+            </form>
+          </section>
+          <section class="settings-section" aria-labelledby="schedule-title">
+            <h3 id="schedule-title">Morning collection</h3>
+            <div id="schedule-summary" class="schedule-summary"><span class="status-label">Loading schedule…</span></div>
+            <form id="schedule-form">
+              <label class="checkbox-label"><input type="checkbox" id="schedule-enabled">Collect automatically every day</label>
+              <label>Local time<input type="time" id="schedule-time" value="07:00" required></label>
+              <button class="button" type="submit">Save schedule</button>
+            </form>
+            <p class="muted">Runs through Windows Task Scheduler even when this dashboard is closed. You must be signed into Windows and Azure CLI. A missed run starts when the computer is available.</p>
+          </section>
+        </div>
+        <section class="history-section" aria-labelledby="history-title">
+          <div class="section-heading compact"><h3 id="history-title">Snapshot history</h3><span class="muted">Times shown in your local timezone</span></div>
+          <div id="history-chart" class="history-chart" aria-label="Model counts by snapshot"></div>
+          <div class="table-scroll" tabindex="0" role="region" aria-label="Scan history">
+            <table><thead><tr><th>Collected</th><th>Source</th><th>Status</th><th>Models</th><th>Records</th><th>Details</th></tr></thead><tbody id="history-body"></tbody></table>
+          </div>
+        </section>
+        <details class="coverage-section" id="coverage-details">
+          <summary>Region coverage for the selected snapshot</summary>
+          <p class="muted">Empty catalogs and failed requests stay visible. A missing result is not treated as zero quota.</p>
+          <div class="table-scroll" tabindex="0" role="region" aria-label="Region collection coverage">
+            <table><thead><tr><th>Subscription</th><th>Region</th><th>Catalog</th><th>Quota health</th><th>Notes</th></tr></thead><tbody id="coverage-body"></tbody></table>
+          </div>
+        </details>
+      </section>
+      <footer class="workspace-footer"><span>SQLite snapshots · read-only Azure access</span><span id="last-update">Waiting for local server</span></footer>
+    </main>
+  </div>
+  <div id="toast" class="toast" role="status" hidden></div>
+</body>
+</html>
