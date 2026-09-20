@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+from contextlib import closing, redirect_stderr, redirect_stdout
 import csv
+import io
+import json
 from pathlib import Path
+import sqlite3
 import tempfile
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
-from dashboard.__main__ import import_snapshot, parser
+from dashboard.__main__ import import_snapshot, main, parser
 
 
 class CommandLineTests(unittest.TestCase):
@@ -55,6 +59,119 @@ class CommandLineTests(unittest.TestCase):
             with self.assertRaises(FileNotFoundError):
                 import_snapshot(store, [Path(directory) / "missing.csv"])
             store.start_scan.assert_not_called()
+
+    def test_rejected_data_directories_do_not_create_files(self):
+        commands = [
+            ["serve"],
+            ["collect"],
+            ["import", "--csv", "missing.csv"],
+            ["configure", "--tenant-id", "fixture", "--subscription-id", "fixture"],
+            ["schedule"],
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "repo"
+            with patch("dashboard.__main__.ROOT", root), patch("dashboard.__main__.Store") as store:
+                for command in commands:
+                    for destination in (root, root / "data-other", root / "data" / ".." / "private"):
+                        with self.subTest(command=command[0], destination=destination):
+                            with self.assertLogs(level="ERROR") as logs:
+                                result = main([*command, "--data-dir", str(destination)])
+                            self.assertEqual(result, 1)
+                            self.assertIn("data directory", logs.output[0])
+                            self.assertFalse(destination.resolve().exists())
+                            store.assert_not_called()
+
+    def test_invalid_serve_port_does_not_create_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "repo"
+            with patch("dashboard.__main__.ROOT", root), patch("dashboard.__main__.Store") as store:
+                for port in ("0", "1023", "65536"):
+                    with self.subTest(port=port):
+                        with self.assertLogs(level="ERROR") as logs:
+                            result = main(["serve", "--port", port])
+                        self.assertEqual(result, 1)
+                        self.assertIn("port between 1024 and 65535", logs.output[0])
+                        self.assertFalse((root / "data").exists())
+                        store.assert_not_called()
+
+    def test_main_imports_into_nested_data_directory_and_releases_database(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            destination = root / "data" / "archive"
+            source = root / "snapshot.csv"
+            source.write_text(
+                "SubscriptionId,Region,Model,Version,SKU,Catalog,Limit,Allocated,"
+                "Remaining,Unit,QuotaStatus,QuotaName\n"
+                "fixture-subscription,eastus,fixture-model,1,GlobalStandard,Listed,"
+                "100,20,80,1K TPM,Reported,fixture-pool\n",
+                encoding="utf-8",
+            )
+            with patch("dashboard.__main__.ROOT", root), redirect_stdout(io.StringIO()) as output:
+                result = main(["import", "--csv", str(source), "--data-dir", str(destination)])
+            self.assertEqual(result, 0)
+            self.assertEqual(json.loads(output.getvalue())["status"], "complete")
+            database = destination / "inventory.sqlite3"
+            self.assertEqual(set(destination.iterdir()), {database})
+            with closing(sqlite3.connect(database)) as connection:
+                self.assertEqual(
+                    connection.execute("SELECT model FROM inventory").fetchall(),
+                    [("fixture-model",)],
+                )
+            database.unlink()
+
+    def test_main_closes_store_after_collection(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for status, expected in (("complete", 0), ("partial", 1), ("failed", 1)):
+                with (
+                    self.subTest(status=status),
+                    patch("dashboard.__main__.ROOT", root),
+                    patch("dashboard.__main__.Store") as store,
+                    patch("dashboard.__main__.Collector") as collector,
+                    redirect_stdout(io.StringIO()),
+                ):
+                    collector.return_value.run_scan.return_value = {"status": status}
+                    self.assertEqual(main(["collect"]), expected)
+                    store.assert_called_once_with(root.resolve() / "data" / "inventory.sqlite3")
+                    store.return_value.close.assert_called_once_with()
+
+    def test_main_closes_store_when_collection_fails(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with (
+                patch("dashboard.__main__.ROOT", Path(directory)),
+                patch("dashboard.__main__.Store") as store,
+                patch("dashboard.__main__.Collector") as collector,
+                self.assertLogs(level="ERROR") as logs,
+            ):
+                collector.return_value.run_scan.side_effect = RuntimeError("fixture failure")
+                self.assertEqual(main(["collect"]), 1)
+                self.assertIn("fixture failure", logs.output[0])
+                store.return_value.close.assert_called_once_with()
+
+    def test_main_closes_store_when_collector_initialization_fails(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with (
+                patch("dashboard.__main__.ROOT", Path(directory)),
+                patch("dashboard.__main__.Store") as store,
+                patch("dashboard.__main__.Collector", side_effect=OSError("fixture failure")),
+                self.assertLogs(level="ERROR") as logs,
+            ):
+                self.assertEqual(main(["schedule"]), 1)
+                self.assertIn("fixture failure", logs.output[0])
+                store.return_value.close.assert_called_once_with()
+
+    def test_main_closes_store_when_interrupted(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with (
+                patch("dashboard.__main__.ROOT", Path(directory)),
+                patch("dashboard.__main__.Store") as store,
+                patch("dashboard.__main__.Collector") as collector,
+                redirect_stderr(io.StringIO()) as error,
+            ):
+                collector.return_value.run_scan.side_effect = KeyboardInterrupt()
+                self.assertEqual(main(["collect"]), 130)
+                self.assertIn("Dashboard stopped.", error.getvalue())
+                store.return_value.close.assert_called_once_with()
 
 
 if __name__ == "__main__":

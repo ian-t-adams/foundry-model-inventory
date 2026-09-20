@@ -9,7 +9,7 @@ import logging
 from pathlib import Path
 import sys
 
-from .collector import Collector
+from .collector import Collector, resolve_data_dir
 from .store import Store
 
 
@@ -68,14 +68,14 @@ def import_snapshot(store: Store, paths: list[Path], started_at: str | None = No
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    data_dir = args.data_dir.resolve()
+    store = None
     try:
-        data_dir.mkdir(parents=True, exist_ok=True)
+        data_dir = resolve_data_dir(ROOT, args.data_dir)
+        if args.command == "serve" and not 1024 <= args.port <= 65535:
+            raise ValueError("Choose a port between 1024 and 65535.")
         store = Store(data_dir / "inventory.sqlite3")
         collector = Collector(store, ROOT, data_dir)
         if args.command == "serve":
-            if not 1024 <= args.port <= 65535:
-                raise ValueError("Choose a port between 1024 and 65535.")
             from .server import serve
 
             print(f"Foundry inventory: http://127.0.0.1:{args.port}", flush=True)
@@ -118,6 +118,9 @@ def main(argv: list[str] | None = None) -> int:
     except (ValueError, RuntimeError, OSError) as exc:
         logging.error("%s", exc)
         return 1
+    finally:
+        if store is not None:
+            store.close()
 
 
 if __name__ == "__main__":
