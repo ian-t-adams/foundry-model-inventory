@@ -501,6 +501,68 @@ class CollectorCase(CollectorFixture):
         self.assertIn("exited 2", failure["message"])
         self.assertIn("Coverage generation failed", self.collector.state()["last_error"])
 
+    def test_missing_cli_account_reports_one_tenant_scoped_recovery(self):
+        self.configure(second=True)
+        diagnostic = (
+            "ERROR: User 'fixture@example.invalid' does not exist in MSAL token cache. "
+            "Run `az login`."
+        )
+        with mock.patch.object(
+            self.collector, "_run_command",
+            return_value=subprocess.CompletedProcess([], 1, "", diagnostic),
+        ) as execute:
+            result = self.collector.run_scan()
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(execute.call_count, 2)
+        self.assertEqual(self.store.ingested[0][1], [])
+        failures = self.store.ingested[0][2]
+        self.assertEqual([item["subscription_id"] for item in failures], [SUB_A, SUB_B])
+        for failure in failures:
+            self.assertIn("MSAL token cache", failure["message"])
+            self.assertNotIn("Inventory CSV", failure["message"])
+        message = self.collector.state()["last_error"]
+        self.assertIn(f'az login --tenant "{TENANT}"', message)
+        self.assertEqual(message.count("az login"), 1)
+        self.assertIn("Windows user", message)
+        self.assertIn("AZURE_CONFIG_DIR", message)
+        self.assertIn("Collect now", message)
+        self.assertNotIn("fixture@example.invalid", message)
+        for subscription in (SUB_A, SUB_B):
+            log = self.data / "runs" / "1" / f"{subscription}.stderr.log"
+            self.assertEqual(log.read_text(encoding="utf-8"), diagnostic)
+        self.assertFalse(self.collector.state()["running"])
+        with _FileLock(self.collector.lock_path):
+            pass
+
+    def test_failed_command_does_not_add_expected_missing_output_errors(self):
+        for returncode in (1, 2):
+            with self.subTest(returncode=returncode):
+                self.configure()
+                with mock.patch.object(
+                    self.collector, "_run_command",
+                    return_value=subprocess.CompletedProcess([], returncode, "", "AuthorizationFailed"),
+                ):
+                    self.assertEqual(self.collector.run_scan()["status"], "failed")
+                message = self.collector.state()["last_error"]
+                self.assertIn("AuthorizationFailed", message)
+                self.assertNotIn("CSV", message)
+                self.assertNotIn("az login", message)
+
+    def test_failed_command_keeps_partial_inventory_without_missing_coverage_noise(self):
+        self.configure()
+
+        def partial(command, timeout, env=None):
+            path = self.outputs(command)
+            path.with_name(f"{SUB_A}-coverage.csv").unlink()
+            return subprocess.CompletedProcess(command, 1, "", "Coverage generation failed")
+
+        with mock.patch.object(self.collector, "_run_command", side_effect=partial):
+            result = self.collector.run_scan()
+        self.assertEqual(result["status"], "partial")
+        self.assertEqual(len(self.store.ingested[0][1]), 1)
+        self.assertIn("Coverage generation failed", self.collector.state()["last_error"])
+        self.assertNotIn("Coverage CSV", self.collector.state()["last_error"])
+
     def test_zero_exit_without_inventory_is_failed_not_complete(self):
         self.configure()
         with mock.patch.object(
@@ -801,6 +863,52 @@ foreach ($path in @($env:FOUNDRY_TEST_REGISTER, $env:FOUNDRY_TEST_RUNNER)) {
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertIn("Enabled,Disable,Status,Time,PythonPath,RepoRoot,DataDirectory", result.stdout)
                 self.assertIn("PythonPath,RepoRoot,DataDirectory", result.stdout)
+
+    def test_dashboard_launcher_selects_one_python_and_restores_working_directory(self):
+        launcher = self.repo / "start-dashboard.ps1"
+        shutil.copyfile(ROOT / "start-dashboard.ps1", launcher)
+        module = self.repo / "dashboard"
+        module.mkdir()
+        (module / "__init__.py").write_text("", encoding="utf-8")
+        (module / "__main__.py").write_text(
+            "import json,os,sys\n"
+            "print(json.dumps({'cwd':os.getcwd(),'argv':sys.argv[1:]}))\n"
+            "sys.exit(int(os.environ['FOUNDRY_TEST_PYTHON_EXIT']))\n",
+            encoding="utf-8",
+        )
+        code = r"""
+$ErrorActionPreference = 'Stop'
+function Get-Command {
+    param($Name, $CommandType, $ErrorAction)
+    if ($Name -ne 'python') { throw 'Unexpected executable lookup' }
+    [pscustomobject]@{Source=$env:FOUNDRY_TEST_PYTHON}
+    [pscustomobject]@{Source=(Join-Path $env:FOUNDRY_TEST_REPO 'must-not-run.exe')}
+}
+$original = (Get-Location).Path
+try {
+    & $env:FOUNDRY_TEST_LAUNCHER -Port 8877 -DataDirectory $env:FOUNDRY_TEST_DATA
+    if ($env:FOUNDRY_TEST_PYTHON_EXIT -ne '0') { throw 'Missing exit-code failure' }
+} catch {
+    if ($env:FOUNDRY_TEST_PYTHON_EXIT -eq '0' -or $_.Exception.Message -ne 'Dashboard exited with code 7.') {
+        throw
+    }
+} finally {
+    if ((Get-Location).Path -ne $original) { throw 'Working directory was not restored' }
+}
+"""
+        for shell in self.shells:
+            for exit_code in (0, 7):
+                with self.subTest(shell=shell.name, exit_code=exit_code):
+                    result = self.ps(shell, code, {
+                        "FOUNDRY_TEST_LAUNCHER": str(launcher),
+                        "FOUNDRY_TEST_PYTHON_EXIT": str(exit_code),
+                    })
+                    self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+                    payload = json.loads(result.stdout)
+                    self.assertEqual(Path(payload["cwd"]), self.repo)
+                    self.assertEqual(payload["argv"], [
+                        "serve", "--port", "8877", "--data-dir", str(self.data),
+                    ])
 
     def test_invalid_time_is_rejected_before_scheduler_query(self):
         code = r"""

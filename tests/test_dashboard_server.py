@@ -208,6 +208,67 @@ class ServerTests(unittest.TestCase):
         scans = json.loads(self.request("GET", "/api/scans")[2])["scans"]
         self.assertEqual([scan["status"] for scan in scans], ["failed", "complete"])
 
+    def test_historical_cli_auth_errors_have_one_recovery_message_without_rewriting_history(self):
+        tenant = "10000000-0000-4000-8000-000000000001"
+        self.collector.config["tenant_id"] = tenant
+        self.collector.config["subscriptions"] = [
+            {"id": subscription, "name": subscription} for subscription in ("sub-a", "sub-b", "sub-c")
+        ]
+        self.server.invalidate_status()
+        complete = self.ingest()
+        failed = self.store.start_scan("fixture")
+        failures = [{
+            "subscription_id": subscription,
+            "message": (
+                "Collector exited 1: ERROR: User 'fixture@example.invalid' does not exist "
+                "in MSAL token cache. Run `az login`.; Inventory CSV is unavailable or "
+                f"invalid: No such file or directory: '{subscription}.csv'"
+            ),
+        } for subscription in ("sub-a", "sub-b", "sub-c")]
+        self.store.ingest_csvs(
+            failed, [], failures=failures, expected_subscriptions=["sub-a", "sub-b", "sub-c"],
+        )
+        result = json.loads(self.request("GET", "/api/status")[2])
+        message = result["collection"]["last_error"]
+        self.assertEqual(result["latest"]["id"], complete)
+        self.assertEqual(result["collection"]["scan_id"], failed)
+        self.assertIn("failed", result["collection"]["message"])
+        self.assertEqual(message.count("az login"), 1)
+        self.assertIn(f'az login --tenant "{tenant}"', message)
+        self.assertNotIn("No such file", message)
+        self.assertNotIn("fixture@example.invalid", message)
+        scans = json.loads(self.request("GET", "/api/scans")[2])["scans"]
+        self.assertEqual([item["message"] for item in scans[0]["errors"]],
+                         [item["message"] for item in failures])
+        self.assertEqual(scans[0]["status"], "failed")
+
+    def test_auth_summary_preserves_other_errors_and_keeps_recovery_visible(self):
+        self.collector.config["tenant_id"] = "10000000-0000-4000-8000-000000000001"
+        self.server.invalidate_status()
+        failed = self.store.start_scan("fixture")
+        self.store.ingest_csvs(failed, [], failures=[
+            {"subscription_id": "sub-a",
+             "message": "User 'fixture' does not exist in MSAL token cache. Run `az login`."},
+            {"subscription_id": "sub-b", "message": "x" * 5000 + " AuthorizationFailed: denied"},
+        ])
+        message = json.loads(self.request("GET", "/api/status")[2])["collection"]["last_error"]
+        self.assertLessEqual(len(message), 1412)
+        self.assertIn("az login --tenant", message)
+        self.assertIn("AuthorizationFailed: denied", message)
+
+    def test_historical_auth_failure_does_not_recommend_a_different_configured_tenant(self):
+        tenant = "10000000-0000-4000-8000-000000000001"
+        self.collector.config.update(tenant_id=tenant, subscriptions=[{"id": "new-sub"}])
+        self.server.invalidate_status()
+        failed = self.store.start_scan("fixture")
+        self.store.ingest_csvs(failed, [], failures=[{
+            "subscription_id": "old-sub",
+            "message": "User 'fixture' does not exist in MSAL token cache. Run `az login`.",
+        }])
+        message = json.loads(self.request("GET", "/api/status")[2])["collection"]["last_error"]
+        self.assertIn('az login --tenant "<affected-tenant-id>"', message)
+        self.assertNotIn(tenant, message)
+
     def test_correct_localhost_host_and_origin_are_allowed(self):
         status = self.request(
             "GET", "/api/status", headers={

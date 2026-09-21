@@ -6,7 +6,7 @@ param(
     [string]$DataDirectory = (Join-Path $PSScriptRoot "data")
 )
 $ErrorActionPreference = "Stop"
-$python = (Get-Command python -CommandType Application -ErrorAction Stop).Source
+$python = (Get-Command python -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
 $DataDirectory = [System.IO.Path]::GetFullPath($DataDirectory)
 Push-Location $PSScriptRoot
 try {

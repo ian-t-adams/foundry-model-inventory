@@ -101,6 +101,28 @@ def _detail(value: Any, limit: int = 1400) -> str:
     return text if len(text) <= limit else "[truncated] " + text[-limit:]
 
 
+def summarize_collection_errors(messages: list[str], tenant_id: str = "") -> str:
+    """Keep recovery guidance concise without changing stored diagnostics."""
+    details = []
+    missing_account = False
+    for message in messages:
+        text = _redact(message).strip()
+        if re.search(r"\bdoes not exist in (?:the )?MSAL token cache\b", text, re.I):
+            missing_account = True
+        elif text:
+            details.append(text)
+    detail = "; ".join(dict.fromkeys(details))
+    if not missing_account:
+        return _detail(detail)
+    tenant = tenant_id if _GUID.fullmatch(tenant_id) else "<affected-tenant-id>"
+    recovery = (
+        "Azure CLI sign-in is required: the account does not exist in MSAL token cache. "
+        f'Run az login --tenant "{tenant}" in a terminal as the same Windows user and '
+        "with the same AZURE_CONFIG_DIR as the collector, then select Collect now."
+    )
+    return recovery + (" " + _detail(detail, 1400 - len(recovery) - 1) if detail else "")
+
+
 def _guid(value: Any, field: str) -> str:
     if not isinstance(value, str) or not _GUID.fullmatch(value):
         raise ValueError(f"{field} must be a UUID in hyphenated form.")
@@ -666,13 +688,15 @@ class Collector:
         try:
             regions = self._inspect_csv(path, subscription_id, tenant)
         except (OSError, UnicodeError, csv.Error, ValueError) as exc:
-            problems.append(f"Inventory CSV is unavailable or invalid: {_detail(exc)}")
+            if not problems or not isinstance(exc, FileNotFoundError):
+                problems.append(f"Inventory CSV is unavailable or invalid: {_detail(exc)}")
             path = None
         if path is not None:
             try:
                 self._inspect_coverage(run_dir / f"{subscription_id}-coverage.csv", subscription_id, regions)
             except (OSError, UnicodeError, csv.Error, ValueError) as exc:
-                problems.append(f"Coverage CSV is unavailable or invalid: {_detail(exc)}")
+                if not problems or not isinstance(exc, FileNotFoundError):
+                    problems.append(f"Coverage CSV is unavailable or invalid: {_detail(exc)}")
         return path, _detail("; ".join(problems)) if problems else None
 
     def _collect(self, lock: _FileLock, config: dict, status: dict, run_dir: Path) -> dict:
@@ -697,7 +721,9 @@ class Collector:
                     paths.append(path)
                 if error:
                     failures.append({"subscription_id": subscription["id"], "message": error})
-                    status["last_error"] = error
+                    status["last_error"] = summarize_collection_errors(
+                        [item["message"] for item in failures], config["tenant_id"],
+                    )
                 status["progress"]["completed"] += 1
                 self._write_status(status)
             result = self.store.ingest_csvs(
@@ -714,7 +740,9 @@ class Collector:
                 running=False,
                 message="Collection complete." if outcome == "complete" else f"Collection {outcome}; inspect scan errors.",
                 last_error=None if outcome == "complete" else (
-                    _detail("; ".join(item["message"] for item in failures))
+                    summarize_collection_errors(
+                        [item["message"] for item in failures], config["tenant_id"],
+                    )
                     or f"Collection {outcome}; catalog or quota errors are recorded in scan history."
                 ),
             )

@@ -15,6 +15,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
+from .collector import summarize_collection_errors
 from .store import CATEGORICAL_FILTERS
 
 
@@ -139,8 +140,13 @@ class _LocalServer(ThreadingHTTPServer):
                 + ("The last complete snapshot remains selected." if latest else
                    "There is no complete snapshot yet.")
             )
-            collection["last_error"] = "; ".join(
-                item["message"] for item in attempt["errors"]
+            configured_subscriptions = {item["id"] for item in cached["config"]["subscriptions"]}
+            same_scope = all(
+                item["subscription_id"] in configured_subscriptions for item in attempt["errors"]
+            )
+            collection["last_error"] = summarize_collection_errors(
+                [item["message"] for item in attempt["errors"]],
+                cached["config"].get("tenant_id", "") if same_scope else "",
             ) or collection.get("last_error", "")
         return {
             "configured": bool(cached["config"].get("tenant_id") and

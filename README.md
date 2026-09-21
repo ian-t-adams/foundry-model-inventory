@@ -124,6 +124,20 @@ authentication expires, run `az login --tenant "<tenant-guid>"` again; failures
 are recorded rather than ingested as an empty estate. Overlapping scheduled and
 manual collections are blocked.
 
+If collection reports **does not exist in MSAL token cache**, Azure CLI still
+has subscription metadata but no usable cached sign-in for the selected account.
+Seeing the subscriptions in `az account list` does not confirm authentication.
+Run `az login --tenant "<tenant-guid>"` interactively for the configured tenant,
+as the same Windows user and with the same `AZURE_CONFIG_DIR` (if set) used by
+the dashboard and scheduled task. Then choose **Collect now**. Do not clear
+shared credentials or change the default subscription as a repair step.
+
+The dashboard summarizes this failure once with sign-in guidance. Original
+diagnostics remain in scan history and the local run logs; missing output files
+are not reported as additional failures when the collector already failed.
+The last complete snapshot remains selected until a new collection succeeds.
+The dashboard never opens a sign-in flow automatically.
+
 The schedule collects data; it does not launch the browser or expose a web
 server. Start the dashboard whenever you want to explore the latest data.
 
