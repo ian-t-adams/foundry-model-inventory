@@ -283,11 +283,21 @@ class Collector:
         self.lock_path = self.data_dir / "collection.lock"
         self._thread: threading.Thread | None = None
 
-    @staticmethod
-    def _validate_config(payload: Any) -> dict:
+    def _profile_directory(self, value: Any) -> Path:
+        if (
+            not isinstance(value, str) or not value or len(value) > 4096
+            or any(ord(char) < 32 for char in value) or not Path(value).is_absolute()
+        ):
+            raise ValueError("azure_config_dir must be an absolute, single-line directory path.")
+        directory = Path(value).resolve()
+        if not directory.is_relative_to(self.repo_root / "data"):
+            raise ValueError("azure_config_dir must remain under the repository's ignored data directory.")
+        return directory
+
+    def _validate_config(self, payload: Any) -> dict:
         if not isinstance(payload, dict):
             raise ValueError("Configuration must be a JSON object.")
-        if set(payload) - {"tenant_id", "subscriptions", "morning_time"}:
+        if set(payload) - {"tenant_id", "subscriptions", "morning_time", "azure_config_dir"}:
             raise ValueError("Configuration contains unsupported fields.")
         tenant = _guid(payload.get("tenant_id"), "tenant_id")
         subscriptions = payload.get("subscriptions")
@@ -311,11 +321,14 @@ class Collector:
                 raise ValueError("Subscription names must be nonempty, single-line text.")
             seen.add(subscription)
             scope.append({"id": subscription, "name": name.strip()})
-        return {
+        config = {
             "tenant_id": tenant,
             "subscriptions": scope,
             "morning_time": _clock(payload.get("morning_time", DEFAULT_TIME)),
         }
+        if "azure_config_dir" in payload:
+            config["azure_config_dir"] = str(self._profile_directory(payload["azure_config_dir"]))
+        return config
 
     @staticmethod
     def _read_json(path: Path) -> Any:
@@ -334,8 +347,29 @@ class Collector:
     def save_config(self, payload: dict) -> dict:
         config = self._validate_config(payload)
         with _FileLock(self.lock_path):
+            if "azure_config_dir" not in payload and self.config_path.exists():
+                previous = self.load_config()
+                if "azure_config_dir" in previous:
+                    config["azure_config_dir"] = previous["azure_config_dir"]
             _atomic_json(self.config_path, config)
         return config
+
+    def _azure_environment(self, azure_config_dir: str | None = None) -> dict | None:
+        directory = (
+            self.load_config().get("azure_config_dir")
+            if azure_config_dir is None else azure_config_dir
+        )
+        if directory is None:
+            return None
+        profile = self._profile_directory(directory)
+        if not profile.is_dir():
+            raise RuntimeError(
+                f"Azure CLI profile directory is unavailable: {profile}. "
+                "Restore the selected directory; shared credentials will not be used."
+            )
+        env = os.environ.copy()
+        env["AZURE_CONFIG_DIR"] = str(profile)
+        return env
 
     def _powershell(self) -> str:
         names = ("pwsh.exe", "powershell.exe") if _WINDOWS else ("pwsh", "powershell")
@@ -424,7 +458,7 @@ class Collector:
         except (ValueError, AttributeError):
             raise RuntimeError(f"{label} returned invalid JSON, not a successful response.") from None
 
-    def discover_subscriptions(self) -> list[dict]:
+    def discover_subscriptions(self, azure_config_dir: str | None = None) -> list[dict]:
         executable = shutil.which("az")
         if not executable:
             raise RuntimeError("Azure CLI is unavailable. Install it and sign in with az login.")
@@ -435,7 +469,7 @@ class Collector:
             self._powershell(), "-NoLogo", "-NoProfile", "-NonInteractive",
             "-EncodedCommand", encoded,
         ]
-        env = os.environ.copy()
+        env = self._azure_environment(azure_config_dir) or os.environ.copy()
         env["FOUNDRY_INVENTORY_AZ_CLI"] = str(Path(executable).resolve())
         accounts = self._json_command(command, "Azure subscription discovery", env)
         if not isinstance(accounts, list):
@@ -668,7 +702,7 @@ class Collector:
         problems = []
         stdout = stderr = ""
         try:
-            result = self._run_command(command, timeout)
+            result = self._run_command(command, timeout, env=self._azure_environment())
             stdout, stderr = result.stdout, result.stderr
             if result.returncode:
                 reason = _detail(stderr or stdout) or "No diagnostic output."

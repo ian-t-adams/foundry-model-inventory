@@ -22,6 +22,33 @@ class CommandLineTests(unittest.TestCase):
         self.assertEqual(args.source, "scheduled")
         self.assertEqual(args.data_dir, Path(r"D:\example\data"))
 
+    def test_configure_discovers_and_saves_the_explicit_cli_profile(self):
+        tenant = "10000000-0000-4000-8000-000000000001"
+        subscription = "20000000-0000-4000-8000-000000000001"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            profile = root / "data" / "azure-cli"
+            with (
+                patch("dashboard.__main__.ROOT", root),
+                patch("dashboard.__main__.Store"),
+                patch("dashboard.__main__.Collector") as collector,
+                redirect_stdout(io.StringIO()),
+            ):
+                collector.return_value.discover_subscriptions.return_value = [{
+                    "id": subscription, "tenant_id": tenant, "name": "Fixture", "state": "Enabled",
+                }]
+                collector.return_value.save_config.return_value = {}
+                result = main([
+                    "configure", "--tenant-id", tenant, "--subscription-id", subscription,
+                    "--azure-config-dir", str(profile),
+                ])
+            self.assertEqual(result, 0)
+            collector.return_value.discover_subscriptions.assert_called_once_with(str(profile.resolve()))
+            collector.return_value.save_config.assert_called_once_with({
+                "tenant_id": tenant, "subscriptions": [{"id": subscription, "name": "Fixture"}],
+                "morning_time": "07:00", "azure_config_dir": str(profile.resolve()),
+            })
+
     def test_import_uses_original_observation_time(self):
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory) / "snapshot.csv"

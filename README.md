@@ -141,6 +141,46 @@ The dashboard never opens a sign-in flow automatically.
 The schedule collects data; it does not launch the browser or expose a web
 server. Start the dashboard whenever you want to explore the latest data.
 
+### Optional isolated Azure CLI profile
+
+For multiple accounts or tenants, keep inventory authentication separate from
+your shared Azure CLI profile. From the checkout, create a new private profile
+under the ignored `data` directory and use normal browser sign-in:
+
+```powershell
+$profileDirectory = Join-Path $PWD "data\azure-cli"
+if (Test-Path -LiteralPath $profileDirectory) {
+    throw "This profile already exists; reuse it deliberately or choose another directory."
+}
+$null = New-Item -ItemType Directory -Path $profileDirectory
+$env:AZURE_CONFIG_DIR = (Resolve-Path -LiteralPath $profileDirectory).Path
+az config set core.enable_broker_on_windows=false core.login_experience_v2=off
+az login --tenant "<tenant-guid>"
+```
+
+Only continue after login completes successfully. Persist the same profile for
+the dashboard and scheduled collector:
+
+```powershell
+python -m dashboard configure `
+    --tenant-id "<tenant-guid>" `
+    --subscription-id "<subscription-guid-1>" "<subscription-guid-2>" `
+    --azure-config-dir $env:AZURE_CONFIG_DIR
+```
+
+The absolute profile path is saved as `azure_config_dir` in `data\config.json`.
+Subscription discovery, **Collect now**, and scheduled collection all use it,
+even when launched from a different terminal. Saving scope or schedule settings
+does not drop the profile selection. The directory must remain under this
+checkout's ignored `data` directory; if it disappears, collection fails rather
+than falling back to shared credentials. Protect it like any credential store,
+and never publish or force-add it to Git.
+
+When `azure_config_dir` is absent, existing Azure CLI environment/default-profile
+behavior is unchanged. To deliberately return to that behavior, stop collection
+and remove that optional field from the local configuration; removing the field
+does not delete the private profile or its credentials.
+
 ### Import an existing snapshot or use the command line
 
 The combined CSV produced by the original inventory scripts can be imported

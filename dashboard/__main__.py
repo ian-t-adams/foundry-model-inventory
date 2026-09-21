@@ -39,6 +39,10 @@ def parser() -> argparse.ArgumentParser:
             command.add_argument("--tenant-id", required=True)
             command.add_argument("--subscription-id", nargs="+", required=True)
             command.add_argument("--morning-time", default="07:00")
+            command.add_argument(
+                "--azure-config-dir", type=Path,
+                help="Existing private Azure CLI profile directory under this checkout's data directory",
+            )
         elif name == "schedule":
             action = command.add_mutually_exclusive_group()
             action.add_argument("--enable", action="store_true")
@@ -88,7 +92,11 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "collect":
             summary = collector.run_scan(source=args.source)
         elif args.command == "configure":
-            subscriptions = collector.discover_subscriptions()
+            profile = str(args.azure_config_dir.resolve()) if args.azure_config_dir is not None else None
+            subscriptions = (
+                collector.discover_subscriptions(profile) if profile is not None
+                else collector.discover_subscriptions()
+            )
             requested = {item.lower() for item in args.subscription_id}
             selected = [
                 {"id": item["id"], "name": item["name"]}
@@ -99,9 +107,12 @@ def main(argv: list[str] | None = None) -> int:
             ]
             if len(selected) != len(requested):
                 raise ValueError("One or more subscriptions are unavailable, disabled, or belong to another tenant.")
-            summary = collector.save_config(
-                {"tenant_id": args.tenant_id, "subscriptions": selected, "morning_time": args.morning_time}
-            )
+            config = {
+                "tenant_id": args.tenant_id, "subscriptions": selected, "morning_time": args.morning_time,
+            }
+            if profile is not None:
+                config["azure_config_dir"] = profile
+            summary = collector.save_config(config)
         else:
             summary = (
                 collector.set_schedule(args.enable, args.time)

@@ -199,6 +199,104 @@ class CollectorCase(CollectorFixture):
         self.collector.save_config(changed)
         self.assertEqual(self.collector.load_config(), changed)
 
+    def test_cli_profile_survives_browser_saves_and_collector_restart(self):
+        profile = self.data / "azure-cli"
+        profile.mkdir()
+        configured = self.collector.save_config({
+            **self.config(), "azure_config_dir": str(profile),
+        })
+        self.assertEqual(configured["azure_config_dir"], str(profile.resolve()))
+        saved = self.collector.save_config({**self.config(), "morning_time": "08:00"})
+        self.assertEqual(saved["azure_config_dir"], str(profile.resolve()))
+        restarted = Collector(self.store, self.repo, self.data)
+        self.assertEqual(restarted.load_config(), saved)
+
+    def test_cli_profile_rejects_relative_invalid_and_unignored_locations(self):
+        self.configure()
+        for profile in ("", ".", "relative", None, 12, "bad\npath", str(self.repo)):
+            with self.subTest(profile=profile), self.assertRaisesRegex(ValueError, "azure_config_dir"):
+                self.collector.save_config({**self.config(), "azure_config_dir": profile})
+        self.assertEqual(self.collector.load_config(), self.config())
+
+    def test_cli_profile_is_explicit_for_discovery_and_both_collection_sources(self):
+        profile = self.data / "private azure & cli"
+        profile.mkdir()
+        self.collector.save_config({**self.config(), "azure_config_dir": str(profile)})
+        payload = [{"id": SUB_A, "tenantId": TENANT, "name": "Fixture", "state": "Enabled"}]
+        with (
+            mock.patch.dict(os.environ, {"AZURE_CONFIG_DIR": "shared-profile-not-selected"}),
+            mock.patch("dashboard.collector.shutil.which", return_value=str(self.repo / "az.cmd")),
+            mock.patch.object(self.collector, "_run_command",
+                              return_value=subprocess.CompletedProcess([], 0, json.dumps(payload), "")) as execute,
+        ):
+            self.collector.discover_subscriptions()
+            self.assertEqual(execute.call_args.args[2]["AZURE_CONFIG_DIR"], str(profile.resolve()))
+            self.assertEqual(os.environ["AZURE_CONFIG_DIR"], "shared-profile-not-selected")
+            for source in ("manual", "scheduled"):
+                with self.subTest(source=source):
+                    execute.reset_mock()
+                    execute.side_effect = self.success
+                    self.assertEqual(self.collector.run_scan(source)["status"], "complete")
+                    self.assertEqual(execute.call_args.kwargs["env"]["AZURE_CONFIG_DIR"],
+                                     str(profile.resolve()))
+                    self.assertNotIn(str(profile), execute.call_args.args[0])
+        self.assertEqual(self.store.started[0][0], "manual")
+        self.assertEqual(self.store.started[1][0], "scheduled")
+
+    def test_missing_cli_profile_never_falls_back_to_shared_credentials(self):
+        profile = self.data / "missing-profile"
+        self.collector.save_config({**self.config(), "azure_config_dir": str(profile)})
+        self.assertEqual(self.collector.load_config()["azure_config_dir"], str(profile.resolve()))
+        with (
+            mock.patch.object(self.collector, "_run_command") as execute,
+            mock.patch("dashboard.collector.shutil.which", return_value=str(self.repo / "az.cmd")),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "Azure CLI profile directory"):
+                self.collector.discover_subscriptions()
+            with self.assertRaisesRegex(RuntimeError, "Azure CLI profile directory"):
+                self.collector.run_scan()
+            execute.assert_not_called()
+        self.assertFalse(profile.exists())
+        self.assertFalse(self.collector.state()["running"])
+
+    def test_fresh_scheduled_collector_uses_persisted_profile(self):
+        profile = self.data / "azure-cli"
+        profile.mkdir()
+        self.collector.save_config({**self.config(), "azure_config_dir": str(profile)})
+        scheduled = Collector(self.store, self.repo, self.data)
+        with (
+            mock.patch.object(scheduled, "_powershell", return_value=str(Path(sys.executable).resolve())),
+            mock.patch.object(scheduled, "_run_command", side_effect=self.success) as execute,
+        ):
+            self.assertEqual(scheduled.run_scan()["status"], "complete")
+        self.assertEqual(self.store.started[0][0], "scheduled")
+        self.assertEqual(execute.call_args.kwargs["env"]["AZURE_CONFIG_DIR"], str(profile.resolve()))
+
+    def test_schedule_changes_preserve_explicit_cli_profile(self):
+        profile = self.data / "azure-cli"
+        profile.mkdir()
+        self.collector.save_config({**self.config(), "azure_config_dir": str(profile)})
+        response = subprocess.CompletedProcess([], 0, json.dumps(self.schedule(clock="06:30")), "")
+        with (
+            mock.patch("dashboard.collector._WINDOWS", True),
+            mock.patch.object(self.collector, "_run_command", return_value=response),
+        ):
+            self.collector.set_schedule(True, "06:30")
+        self.assertEqual(self.collector.load_config()["azure_config_dir"], str(profile.resolve()))
+        self.assertEqual(self.collector.load_config()["morning_time"], "06:30")
+
+    def test_discovery_can_select_a_profile_before_saving_subscription_scope(self):
+        profile = self.data / "azure-cli"
+        profile.mkdir()
+        with (
+            mock.patch("dashboard.collector.shutil.which", return_value=str(self.repo / "az.cmd")),
+            mock.patch.object(self.collector, "_run_command",
+                              return_value=subprocess.CompletedProcess([], 0, "[]", "")) as execute,
+        ):
+            self.assertEqual(self.collector.discover_subscriptions(str(profile)), [])
+        self.assertEqual(execute.call_args.args[2]["AZURE_CONFIG_DIR"], str(profile.resolve()))
+        self.assertFalse(self.collector.config_path.exists())
+
     def test_malformed_config_fails_explicitly_and_releases_scan_lock(self):
         self.collector.config_path.write_text('{"tenant_id": ', encoding="utf-8")
         with self.assertRaisesRegex(ValueError, "Malformed config.json"):
@@ -1009,6 +1107,30 @@ function Get-ScheduledTask { throw 'Access denied to the named task.' }
                 self.assertEqual(result, [{
                     "id": SUB_A, "tenant_id": TENANT, "name": "Mock subscription", "state": "Enabled",
                 }])
+
+    def test_private_profile_reaches_real_powershell_child_without_mutating_parent(self):
+        profile = self.data / "private azure & cli"
+        profile.mkdir()
+        self.collector.save_config({**self.config(), "azure_config_dir": str(profile)})
+        az_path = self.repo / "profile-check.cmd"
+        az_path.write_text(
+            "@echo off\n"
+            'if not "%AZURE_CONFIG_DIR%"=="%FOUNDRY_TEST_EXPECTED_PROFILE%" exit /b 19\n'
+            "echo []\nexit /b 0\n",
+            encoding="utf-8",
+        )
+        for shell in self.shells:
+            with (
+                self.subTest(shell=shell),
+                mock.patch.dict(os.environ, {
+                    "AZURE_CONFIG_DIR": "shared-profile-not-selected",
+                    "FOUNDRY_TEST_EXPECTED_PROFILE": str(profile.resolve()),
+                }),
+                mock.patch.object(self.collector, "_powershell", return_value=str(shell)),
+                mock.patch("dashboard.collector.shutil.which", return_value=str(az_path)),
+            ):
+                self.assertEqual(self.collector.discover_subscriptions(), [])
+                self.assertEqual(os.environ["AZURE_CONFIG_DIR"], "shared-profile-not-selected")
 
     def test_disable_only_modifies_the_named_current_user_task(self):
         code = r"""
