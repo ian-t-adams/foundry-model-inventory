@@ -76,6 +76,54 @@ assert.equal(initial.subscriptions[0].tenant_id, undefined);
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
+    @unittest.skipUnless(shutil.which("node"), "Node is optional; required only for this browser-logic unit test")
+    def test_filter_rail_measures_the_longest_labels_every_filter_can_show(self):
+        script = r"""
+const fs = require("node:fs");
+const vm = require("node:vm");
+const assert = require("node:assert/strict");
+const source = fs.readFileSync(process.argv[1], "utf8")
+  .replace(/^import .*\r?\n/, "")
+  .replace(/\r?\nboot\(\);\s*$/, "");
+const context = {};
+vm.runInNewContext(source, context);
+const tenant = "10000000-0000-4000-8000-000000000001";
+const subscriptionId = "30000000-0000-4000-8000-000000000001";
+const model = "Example-Model-With-A-Long-Descriptive-Name";
+const facets = {
+  tenant: [tenant],
+  subscription: [{ value: subscriptionId, label: "Example subscription" }],
+  region: ["example-region"],
+  model: [model],
+  model_version: [{ label: `${model} 2026-01-01`, model, version: "2026-01-01", format: "Example" }],
+};
+const choices = context.railChoices(facets);
+const labels = choices.map((choice) => choice.label);
+for (const expected of [tenant, "Example subscription", model, `${model} 2026-01-01`, "2026-01-01",
+  "Choose a model first", "Has remaining quota"]) {
+  assert.ok(labels.includes(expected), expected);
+}
+assert.ok(!labels.includes(subscriptionId), "subscriptions are shown by name");
+assert.ok(choices.some((choice) => choice.label === "2026-01-01" && choice.description === `${model} · Example`));
+const many = { region: Array.from({ length: 200 }, (_, index) => `region-${index}`), model: [model] };
+const bounded = context.railChoices(many, 3);
+assert.equal(bounded.length, 3);
+assert.equal(bounded[0].label, model);
+"""
+        result = subprocess.run(
+            [shutil.which("node"), "-e", script, str(STATIC / "app.js")],
+            text=True, capture_output=True, timeout=30, check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_filter_rail_width_is_fitted_within_bounds_at_every_breakpoint(self):
+        css = (STATIC / "styles.css").read_text(encoding="utf-8")
+        columns = re.findall(r"\.workspace\s*\{[^}]*grid-template-columns:\s*([^;]+);", css)
+        self.assertEqual(len(columns), 1, "breakpoints adjust the rail bounds instead of fixing its width")
+        self.assertRegex(columns[0], r"^clamp\(var\(--rail-min\),.*var\(--rail-content\).*,\s*var\(--rail-max\)\)")
+        self.assertRegex(css, r"--rail-max:\s*clamp\(224px,\s*100vw - var\(--rail-reserve\),\s*400px\)")
+        self.assertRegex(css, r"\.filter-rail\s*\{[^}]*scrollbar-gutter:\s*stable")
+
     def test_semantic_text_and_chart_contrast_in_both_themes(self):
         css = (STATIC / "styles.css").read_text(encoding="utf-8")
         light = re.search(r":root\s*\{([^}]+)\}", css).group(1)

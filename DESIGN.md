@@ -23,8 +23,13 @@ collection settings are adjacent views, not a separate application.
 
 ## Structure
 
-The 66px application bar holds identity and collection. A 248px filter rail
-holds tenant, subscription, model and deployment filters plus browser-local saved views.
+The 66px application bar holds identity and collection. The filter rail holds
+tenant, subscription, model and deployment filters plus browser-local saved views.
+It sizes itself to the longest label the loaded snapshot can show, so tenant IDs and
+subscription and model names stay on one line, between a 224-265px floor that follows
+the window width and 400px. Above that floor it leaves at least 870px of the window for
+the quota table, or 1160px while model details sit beside it. Its width follows the
+snapshot, the window and the details column, never the filter being opened or edited.
 The main area contains a snapshot selector, three view tabs, a compact summary,
 and the inventory table. A compact, clickable bar chart and grouped table views
 expose family -> model -> model/version -> deployment options. Breadcrumbs

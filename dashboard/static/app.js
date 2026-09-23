@@ -1,4 +1,4 @@
-import { MultiSelect, closeMultiSelects } from "./controls.js";
+import { MultiSelect, closeMultiSelects, measureChoices } from "./controls.js";
 
 const $ = (id) => document.getElementById(id);
 const multiKeys = ["tenant", "subscription", "region", "family", "model", "model_version", "deployment_type",
@@ -16,6 +16,11 @@ const defaultOptions = {
   capacity_type: "All capacity types", availability: "Any quota state",
   lifecycle: "All lifecycle states", unit: "All units",
 };
+const availabilityOptions = [
+  { value: "available", label: "Has remaining quota" },
+  { value: "exhausted", label: "No remaining quota" },
+  { value: "unknown", label: "Quota unknown" },
+];
 const controls = new Map();
 const viewNames = { quota: "quota entries", deployments: "catalog options", family: "families", model: "models", model_version: "model/version choices" };
 const state = {
@@ -28,11 +33,13 @@ const state = {
 const numberFormat = new Intl.NumberFormat(undefined, { maximumFractionDigits: 3 });
 const dateFormat = new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
 const savedKey = "foundry-inventory.saved-views.v1";
+const railKey = "foundry-inventory.rail-width.v1";
 let toastTimeout;
 let searchTimeout;
 let pollPending = false;
 let coverageLoaded = false;
 let filterTimeout;
+let railFrame = 0;
 
 function el(tag, className, text) {
   const node = document.createElement(tag);
@@ -250,6 +257,16 @@ function renderFacets(facets) {
   updateChoiceOptions();
   syncFilterControls();
   renderFilterChips();
+  fitFilterRail();
+}
+
+function versionChoice(option, singleModel) {
+  return {
+    ...option,
+    label: singleModel ? option.version || "(version not reported)" : option.label,
+    description: singleModel ? `${option.model} · ${option.format}` : option.format,
+    searchText: option.label,
+  };
 }
 
 function updateChoiceOptions() {
@@ -257,23 +274,14 @@ function updateChoiceOptions() {
   const families = new Set(selected("family"));
   const models = new Set(selected("model"));
   const eligiblePairs = models.size ? pairs.filter((option) =>
-    (!families.size || families.has(option.family)) && models.has(option.model)).map((option) => ({
-    ...option,
-    label: models.size === 1 ? option.version || "(version not reported)" : option.label,
-    description: models.size === 1 ? `${option.model} · ${option.format}` : option.format,
-    searchText: option.label,
-  })) : [];
+    (!families.size || families.has(option.family)) && models.has(option.model))
+    .map((option) => versionChoice(option, models.size === 1)) : [];
   const eligibleModels = families.size ?
     [...new Set(pairs.filter((option) => families.has(option.family)).map((option) => option.model))].sort() :
     state.facets.model || [];
-  const availability = [
-    { value: "available", label: "Has remaining quota" },
-    { value: "exhausted", label: "No remaining quota" },
-    { value: "unknown", label: "Quota unknown" },
-  ];
   for (const [key, control] of controls) {
     control.setOptions(key === "model_version" ? eligiblePairs :
-      key === "model" ? eligibleModels : key === "availability" ? availability : state.facets[key] || []);
+      key === "model" ? eligibleModels : key === "availability" ? availabilityOptions : state.facets[key] || []);
   }
   controls.get("model_version").setContext({
     disabled: !models.size,
@@ -281,6 +289,53 @@ function updateChoiceOptions() {
     hint: models.size === 1 ? `Only versions of ${[...models][0]} are shown.` :
       models.size > 1 ? `Versions are scoped to your ${models.size} selected models.` : "",
   });
+}
+
+// The longest labels any filter can show for this snapshot, independent of the current selection, so
+// the rail keeps one width while the user filters. Character count tracks rendered width closely
+// enough that only these candidates need a layout pass.
+function railChoices(facets, limit = 48) {
+  const choices = [...Object.values(defaultOptions), "All versions"].map((label) => ({ label }));
+  for (const key of multiKeys) {
+    const options = key === "availability" ? availabilityOptions : key === "model_version" ? [] : facets[key] || [];
+    for (const option of options) choices.push({ label: typeof option === "string" ? option : option.label });
+  }
+  for (const option of facets.model_version || []) choices.push(versionChoice(option, false), versionChoice(option, true));
+  const size = ({ label, description }) => Math.max(String(label ?? "").length, String(description ?? "").length);
+  return choices.sort((a, b) => size(b) - size(a)).slice(0, limit);
+}
+
+function setRailContent(width) {
+  document.querySelector(".workspace").style.setProperty("--rail-content", `${width}px`);
+  syncRailGutter();
+}
+
+function syncRailGutter() {
+  const rail = document.querySelector(".filter-rail");
+  const style = getComputedStyle(rail);
+  if (!rail.offsetWidth || style.overflowY === "visible") return;
+  const gutter = rail.offsetWidth - rail.clientWidth -
+    parseFloat(style.borderLeftWidth) - parseFloat(style.borderRightWidth);
+  rail.parentElement.style.setProperty("--rail-gutter", `${Math.max(0, gutter)}px`);
+}
+
+function fitFilterRail() {
+  const width = measureChoices(railChoices(state.facets)) + 1;
+  setRailContent(width);
+  try {
+    localStorage.setItem(railKey, String(width));
+  } catch {
+    // Without storage the rail still fits; the next page load starts from the default width.
+  }
+}
+
+function restoreRailWidth() {
+  try {
+    const width = Number(localStorage.getItem(railKey));
+    if (width > 0 && width <= 1000) setRailContent(width);
+  } catch {
+    // Browser storage only avoids a width change on load; the rail is fitted after data arrives.
+  }
 }
 
 function changeFilter(key, values) {
@@ -1428,12 +1483,17 @@ function wireEvents() {
     })();
   });
   document.addEventListener("visibilitychange", () => { if (!document.hidden) pollStatus(); });
+  window.addEventListener("resize", () => {
+    cancelAnimationFrame(railFrame);
+    railFrame = requestAnimationFrame(syncRailGutter);
+  });
   document.addEventListener("keydown", (event) => {
     if (event.key === "Escape" && !closeMultiSelects(true)) closeDetail();
   });
 }
 
 async function boot() {
+  restoreRailWidth();
   for (const key of multiKeys) {
     controls.set(key, new MultiSelect($(`filter-${key}`), {
       label: key === "family" ? "Model family" : key === "deployment_type" ? "Deployment geography" :
