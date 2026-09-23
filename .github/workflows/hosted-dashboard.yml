@@ -81,6 +81,7 @@ jobs:
       group: hosted-dashboard-deploy
       cancel-in-progress: false
     env:
+      AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
       AZURE_RESOURCE_GROUP: ${{ secrets.AZURE_RESOURCE_GROUP }}
       AZURE_WEBAPP_NAME: ${{ secrets.AZURE_WEBAPP_NAME }}
       AZURE_ACR_NAME: ${{ secrets.AZURE_ACR_NAME }}
@@ -110,12 +111,19 @@ jobs:
       - name: Point the web app at this commit
         run: |
           image="${AZURE_ACR_NAME}.azurecr.io/foundry-inventory:${GITHUB_SHA}"
-          az webapp config set --resource-group "$AZURE_RESOURCE_GROUP" --name "$AZURE_WEBAPP_NAME" \
-            --linux-fx-version "DOCKER|${image}" --output none --only-show-errors
-          actual="$(az webapp config show --resource-group "$AZURE_RESOURCE_GROUP" --name "$AZURE_WEBAPP_NAME" \
-            --query linuxFxVersion --output tsv --only-show-errors)"
+          config="https://management.azure.com/subscriptions/${AZURE_SUBSCRIPTION_ID}/resourceGroups/${AZURE_RESOURCE_GROUP}/providers/Microsoft.Web/sites/${AZURE_WEBAPP_NAME}/config/web?api-version=2024-04-01"
+          # Patch only the image so every other site and app setting stays as deployed.
+          az rest --method patch --url "$config" --only-show-errors --output none \
+            --body "{\"properties\": {\"linuxFxVersion\": \"DOCKER|${image}\"}}"
+          actual="$(az rest --method get --url "$config" --query properties.linuxFxVersion --output tsv --only-show-errors)"
           if [ "$actual" != "DOCKER|${image}" ]; then
             echo "::error::The web app does not reference the image for ${GITHUB_SHA}."
+            exit 1
+          fi
+          storage="$(az webapp config appsettings list --resource-group "$AZURE_RESOURCE_GROUP" --name "$AZURE_WEBAPP_NAME" \
+            --query "[?name=='WEBSITES_ENABLE_APP_SERVICE_STORAGE'].value | [0]" --output tsv --only-show-errors)"
+          if [ "$storage" != "true" ]; then
+            echo "::error::Persistent /home storage is not enabled; the database backup would not survive restarts."
             exit 1
           fi
           echo "The web app now runs foundry-inventory:${GITHUB_SHA}."
