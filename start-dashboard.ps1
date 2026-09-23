@@ -3,9 +3,12 @@
 param(
     [ValidateRange(1024, 65535)]
     [int]$Port = 8765,
-    [string]$DataDirectory = (Join-Path $PSScriptRoot "data")
+    [string]$DataDirectory
 )
 $ErrorActionPreference = "Stop"
+if (-not $PSBoundParameters.ContainsKey("DataDirectory")) {
+    $DataDirectory = Join-Path $PSScriptRoot "data"
+}
 $python = (Get-Command python -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
 $DataDirectory = [System.IO.Path]::GetFullPath($DataDirectory)
 Push-Location $PSScriptRoot

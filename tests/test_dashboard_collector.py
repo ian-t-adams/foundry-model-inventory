@@ -1008,6 +1008,33 @@ try {
                         "serve", "--port", "8877", "--data-dir", str(self.data),
                     ])
 
+    def test_dashboard_launcher_default_data_directory_from_file_entrypoint(self):
+        launcher = self.repo / "start-dashboard.ps1"
+        shutil.copyfile(ROOT / "start-dashboard.ps1", launcher)
+        module = self.repo / "dashboard"
+        module.mkdir()
+        (module / "__init__.py").write_text("", encoding="utf-8")
+        (module / "__main__.py").write_text(
+            "import json,os,sys\n"
+            "print(json.dumps({'cwd':os.getcwd(),'argv':sys.argv[1:]}))\n",
+            encoding="utf-8",
+        )
+        for shell in self.shells:
+            with self.subTest(shell=shell.name):
+                result = subprocess.run(
+                    [str(shell), "-NoLogo", "-NoProfile", "-NonInteractive",
+                     "-File", str(launcher), "-Port", "8877"],
+                    cwd=self.repo, env={**os.environ, "PYTHONUTF8": "1"},
+                    capture_output=True, text=True, encoding="utf-8",
+                    errors="replace", timeout=15, shell=False,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+                payload = json.loads(result.stdout)
+                self.assertEqual(Path(payload["cwd"]), self.repo)
+                self.assertEqual(payload["argv"], [
+                    "serve", "--port", "8877", "--data-dir", str(self.data),
+                ])
+
     def test_invalid_time_is_rejected_before_scheduler_query(self):
         code = r"""
 function Get-ScheduledTask { throw 'SCHEDULER_MUST_NOT_BE_CALLED' }

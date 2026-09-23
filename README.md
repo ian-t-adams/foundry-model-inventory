@@ -35,6 +35,44 @@ foreground until you press Ctrl+C. Use `-Port` to choose another local port.
 There are no external fonts, CDNs, analytics, or automatic browser calls to
 Azure. Public pricing references are opened only when you choose their link.
 
+### Double-click launcher (Windows)
+
+If you prefer a click-to-open executable rather than starting PowerShell from
+a terminal, build the optional launcher once from a local checkout with the
+.NET 10 SDK:
+
+```powershell
+dotnet publish .\launcher\FoundryQuota.csproj -c Release -o .\data\launcher
+```
+
+Double-click **`data\launcher\FoundryQuota.exe`** in File Explorer. It opens a
+separate Windows PowerShell window for the dashboard, waits until the local
+server responds, then opens the default browser at
+**http://127.0.0.1:8765/**. Leave the PowerShell window open to keep browsing;
+press Ctrl+C there to stop the server. If the dashboard is already running on
+that port, double-clicking opens it without starting a second copy. A different
+service on the port is reported as an error, not opened in your browser. An
+already-running server keeps its original process ownership; stop a dashboard
+started in Copilot before launching it independently.
+
+The executable is a launcher, not a bundled copy of your inventory, Python,
+PowerShell, or Azure CLI. It needs the .NET 10 runtime on the machine that
+runs it; the .NET SDK is needed only to build it. It uses the source and ignored
+`data` directory of the checkout containing `data\launcher`, so it works
+without a Copilot terminal and keeps local credentials out of the executable.
+It does not update the checkout, run collection automatically, or change the
+morning schedule. If the source is updated from `main`, the next launch uses
+the updated checked-out code. Keep the executable in that checkout, not on
+the Desktop by itself.
+
+The friendly bookmark name **Foundry quota** can point to the loopback URL.
+Names such as `foundryquota.127.com` are not inherently local and do not make
+the dashboard accessible from other devices: `127.0.0.1` always means the
+device using the URL. This local dashboard has **no user authentication** and
+must not be exposed through public DNS, port forwarding, or an unprotected
+tunnel. Remote access needs a separate HTTPS and authentication design, such
+as the proposed Entra-protected Azure web app.
+
 In **Collection & history**, discover the subscriptions from your existing Azure
 CLI sign-in, choose one tenant and the subscriptions to collect, and save the
 scope. **Collect now** starts a read-only estate scan. You can keep browsing the
