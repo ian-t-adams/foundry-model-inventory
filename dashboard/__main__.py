@@ -25,11 +25,14 @@ def parser() -> argparse.ArgumentParser:
         ("import", "Import existing inventory CSV files as one historical snapshot"),
         ("configure", "Select the tenant and subscriptions to collect"),
         ("schedule", "Manage the daily Windows collection task"),
+        ("hosted", "Serve the read-only dashboard behind App Service authentication and collect daily"),
     ]:
         command = commands.add_parser(name, help=description)
         command.add_argument("--data-dir", type=Path, default=ROOT / "data")
         if name == "serve":
             command.add_argument("--port", type=int, default=8765)
+        elif name == "hosted":
+            command.add_argument("--port", type=int, default=8000)
         elif name == "collect":
             command.add_argument("--source", choices=["manual", "scheduled"], default="manual")
         elif name == "import":
@@ -77,8 +80,13 @@ def main(argv: list[str] | None = None) -> int:
     store = None
     try:
         data_dir = resolve_data_dir(ROOT, args.data_dir)
-        if args.command == "serve" and not 1024 <= args.port <= 65535:
+        if args.command in ("serve", "hosted") and not 1024 <= args.port <= 65535:
             raise ValueError("Choose a port between 1024 and 65535.")
+        if args.command == "hosted":
+            from .hosted import run
+
+            # Hosted mode restores its database before opening it, so it owns the store.
+            return run(ROOT, data_dir, port=args.port)
         store = Store(data_dir / "inventory.sqlite3")
         collector = Collector(store, ROOT, data_dir)
         if args.command == "serve":

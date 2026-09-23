@@ -139,7 +139,9 @@ async function api(path, body) {
   try {
     response = await fetch(path, options);
   } catch {
-    throw new Error("The local server is unreachable. Start the dashboard and try again.");
+    throw new Error(state.status?.read_only ?
+      "The hosted dashboard is unreachable or your sign-in expired. Reload the page to sign in again." :
+      "The local server is unreachable. Start the dashboard and try again.");
   }
   const contentType = response.headers.get("content-type") || "";
   const data = contentType.includes("application/json") ? await response.json() : null;
@@ -507,6 +509,14 @@ function finishTable(data) {
   renderBreadcrumbs();
 }
 
+function emptyEstate() {
+  return state.status?.read_only ? {
+    title: "Waiting for the first hosted collection",
+    text: "The hosted service collects every morning with read-only access. Collection & history shows its latest attempt and next run.",
+    action: "View collection status",
+  } : null;
+}
+
 function renderInventory(data) {
   state.rows = data.rows;
   renderTableHeader();
@@ -515,10 +525,11 @@ function renderInventory(data) {
   body.replaceChildren();
   if (!data.rows.length) {
     if (!data.snapshot) {
-      const button = el("button", "button primary", "Set up collection");
+      const hosted = emptyEstate();
+      const button = el("button", "button primary", hosted?.action || "Set up collection");
       button.type = "button";
       button.addEventListener("click", () => selectTab("collection"));
-      body.append(emptyRow(7, "Your estate, ready to explore", "Choose the subscriptions to collect, then take your first snapshot. Existing CSVs can also be imported from the command line.", button));
+      body.append(emptyRow(7, hosted?.title || "Your estate, ready to explore", hosted?.text || "Choose the subscriptions to collect, then take your first snapshot. Existing CSVs can also be imported from the command line.", button));
     } else {
       body.append(emptyRow(7, "No entries match these filters", "Try a different region or capacity type, or reset your filters. Unknown quota is kept separate from zero."));
     }
@@ -585,12 +596,13 @@ function renderQuota(data) {
   const body = $("inventory-body");
   body.replaceChildren();
   if (!data.rows.length) {
-    const setup = el("button", "button primary", "Set up collection");
+    const hosted = emptyEstate();
+    const setup = el("button", "button primary", hosted?.action || "Set up collection");
     setup.type = "button";
     setup.addEventListener("click", () => selectTab("collection"));
-    body.append(emptyRow(4, data.snapshot ? "No quota entries match this selection" : "Collect your first quota snapshot",
+    body.append(emptyRow(4, data.snapshot ? "No quota entries match this selection" : hosted?.title || "Collect your first quota snapshot",
       data.snapshot ? "Try another region, model or deployment type, or lower the minimum. Missing quota is never treated as zero." :
-        "Choose your subscriptions in Collection & history to see reported quota here.", data.snapshot ? null : setup));
+        hosted?.text || "Choose your subscriptions in Collection & history to see reported quota here.", data.snapshot ? null : setup));
   }
   for (const pool of data.rows) {
     const row = el("tr");
@@ -983,10 +995,113 @@ async function viewSnapshot(id) {
   renderHistory(state.scans);
 }
 
+function hostedView(status) {
+  if (!status || status.read_only !== true) return null;
+  const hosted = status.hosted || {};
+  const time = /^([01]\d|2[0-3]):[0-5]\d$/.test(hosted.collection_time || "") ? hosted.collection_time : "07:00";
+  const zone = typeof hosted.timezone === "string" && hosted.timezone.trim() ? hosted.timezone.trim() : "UTC";
+  const commit = /^[0-9a-f]{7,40}$/.test(hosted.commit || "") ? hosted.commit : "";
+  const subscriptions = Array.isArray(status.config?.subscriptions) ? status.config.subscriptions : [];
+  const tenants = new Set(subscriptions.map((sub) => sub.tenant_id || status.config?.tenant_id || "")).size;
+  const attempt = hosted.last_attempt && typeof hosted.last_attempt.status === "string" ? hosted.last_attempt : null;
+  const backup = hosted.backup && typeof hosted.backup === "object" ? hosted.backup : null;
+  const count = (value, noun) => `${value} ${noun}${value === 1 ? "" : "s"}`;
+  return {
+    label: "Hosted · read-only",
+    schedule: `Daily at ${time} · ${zone}`,
+    explanation: `This hosted service collects every morning at ${time} (${zone}) with its own read-only Azure identity. ` +
+      "Collection, scope and schedule changes are made through its deployment, not in the browser.",
+    scope: `${count(subscriptions.length, "subscription")} in ${count(tenants, "tenant")}, collected by the hosted service.`,
+    subscriptions: subscriptions.map((sub) => ({ id: String(sub.id || ""), name: String(sub.name || sub.id || "") })),
+    commit: commit ? commit.slice(0, 7) : "not recorded",
+    commitTitle: commit || "This build did not record its commit.",
+    nextRun: typeof hosted.next_run === "string" ? hosted.next_run : null,
+    attempt: attempt ? { status: attempt.status, at: attempt.completed_at || attempt.started_at || null } : null,
+    backup: backup?.error ? { error: String(backup.error) } :
+      backup?.saved_at ? { savedAt: backup.saved_at } :
+        backup?.restored_at ? { restoredAt: backup.restored_at } : null,
+    user: typeof hosted.user === "string" ? hosted.user.slice(0, 256) : "",
+  };
+}
+
+function statusNotice(data, now = Date.now()) {
+  const collecting = Boolean(data.collection?.running);
+  const hosted = data.read_only === true;
+  if (!data.configured) {
+    return hosted ?
+      { message: "The hosted service has no collection scope. Redeploy it with the subscriptions to collect.", type: "error" } :
+      { message: "Choose your tenant and subscriptions in Collection & history before starting a scan.", type: "" };
+  }
+  if (data.collection?.last_error && !collecting) {
+    const detail = String(data.collection.last_error).replace(/[.\s]+$/, "");
+    return { message: `The last collection needs attention: ${detail}. The latest complete snapshot is still available.`, type: "error" };
+  }
+  if (data.scope_pending && !collecting) {
+    return { message: hosted ?
+      "The latest complete snapshot does not cover every configured subscription yet. The next hosted collection includes them." :
+      "The latest complete snapshot does not cover the current tenant and subscription selection. Collect now to refresh the full scope.",
+    type: "warning" };
+  }
+  if (data.latest && now - new Date(data.latest.started_at).getTime() > 30 * 60 * 60 * 1000) {
+    return { message: hosted ?
+      "The latest complete snapshot is more than 30 hours old. Collection & history shows the hosted service's latest attempt." :
+      "The latest complete snapshot is more than 30 hours old. Collect now or check the morning schedule.",
+    type: "warning" };
+  }
+  return { message: "", type: "" };
+}
+
+function applyMode(hosted) {
+  if (!hosted) return;
+  document.title = "Foundry inventory — hosted";
+  $("workspace-mode").textContent = hosted.label;
+  $("workspace-note").replaceChildren("Hosted in your Azure subscription.", el("br"), "Microsoft Entra sign-in, read-only access.");
+  $("workspace-footer-note").textContent = `SQLite snapshots · read-only Azure access · commit ${hosted.commit}`;
+  $("workspace-footer-note").title = hosted.commitTitle;
+  $("scan-button").hidden = true;
+  $("discover-button").hidden = true;
+  $("config-form").hidden = true;
+  $("schedule-form").hidden = true;
+  const signOut = $("sign-out");
+  signOut.hidden = false;
+  signOut.title = hosted.user ? `Signed in as ${hosted.user}` : "Sign out of the hosted dashboard";
+  signOut.setAttribute("aria-label", hosted.user ? `Sign out ${hosted.user}` : "Sign out");
+}
+
+function renderHosted(hosted) {
+  $("scope-summary").textContent = hosted.scope;
+  const list = $("scope-list");
+  list.replaceChildren(...[...hosted.subscriptions].sort((a, b) => a.name.localeCompare(b.name)).map((sub) => {
+    const item = el("li", "", sub.name);
+    item.append(el("span", "cell-secondary", sub.id));
+    return item;
+  }));
+  list.hidden = !hosted.subscriptions.length;
+  const summary = $("schedule-summary");
+  summary.replaceChildren(el("span", "status-label complete", hosted.schedule));
+  summary.append(el("p", "", `Next collection: ${hosted.nextRun ? when(hosted.nextRun) : "being scheduled"}`));
+  if (hosted.attempt) {
+    const attempt = el("p", "", "Latest attempt: ");
+    attempt.append(el("span", `status-label ${hosted.attempt.status}`, hosted.attempt.status), ` ${when(hosted.attempt.at)}`);
+    summary.append(attempt);
+  } else {
+    summary.append(el("p", "", "Latest attempt: none yet. The first collection starts shortly after deployment."));
+  }
+  if (hosted.backup?.error) summary.append(el("p", "backup-warning", hosted.backup.error));
+  else if (hosted.backup?.savedAt) summary.append(el("p", "", `Persistent copy saved: ${when(hosted.backup.savedAt)}`));
+  else if (hosted.backup?.restoredAt) summary.append(el("p", "", `Restored from the persistent copy: ${when(hosted.backup.restoredAt)}`));
+  const commit = el("p", "", `Deployed commit: ${hosted.commit}`);
+  commit.title = hosted.commitTitle;
+  summary.append(commit);
+  $("schedule-note").textContent = hosted.explanation;
+}
+
 function applyStatus(data) {
   const previous = state.status;
   state.status = data;
   state.csrf = data.csrf_token;
+  const hosted = hostedView(data);
+  applyMode(hosted);
   const collecting = Boolean(data.collection?.running);
   $("scan-button").disabled = collecting;
   $("scan-button").querySelector("span").textContent = collecting ? "Collecting…" : "Collect now";
@@ -998,19 +1113,11 @@ function applyStatus(data) {
     $("scan-progress-bar").max = Math.max(1, progress.total || 1);
     $("scan-progress-bar").value = progress.completed || 0;
   }
-  renderSchedule(data.schedule);
+  if (!hosted) renderSchedule(data.schedule);
   if (!state.initialized) renderConfig(data.config);
-  if (!data.configured) {
-    notice("Choose your tenant and subscriptions in Collection & history before starting a scan.", "");
-  } else if (data.collection?.last_error && !collecting) {
-    notice(`The last collection needs attention: ${data.collection.last_error}. The latest complete snapshot is still available.`, "error");
-  } else if (data.scope_pending && !collecting) {
-    notice("The latest complete snapshot does not cover the current tenant and subscription selection. Collect now to refresh the full scope.", "warning");
-  } else if (data.latest && Date.now() - new Date(data.latest.started_at).getTime() > 30 * 60 * 60 * 1000) {
-    notice("The latest complete snapshot is more than 30 hours old. Collect now or check the morning schedule.", "warning");
-  } else {
-    notice("");
-  }
+  if (hosted) renderHosted(hosted);
+  const { message, type } = statusNotice(data);
+  notice(message, type);
   return previous && (previous.collection?.running && !collecting ||
     previous.latest?.id !== data.latest?.id);
 }
@@ -1284,7 +1391,7 @@ async function pollStatus() {
       if (!status.collection?.last_error) toast("Collection finished. Your snapshot is ready.");
     }
   } catch (error) {
-    $("scan-state").textContent = "Server offline";
+    $("scan-state").textContent = state.status?.read_only ? "Connection lost" : "Server offline";
     notice(error.message, "error");
   } finally {
     pollPending = false;

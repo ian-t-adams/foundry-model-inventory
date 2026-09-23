@@ -65,3 +65,23 @@ snapshot that does not yet contain it.
 
 Do not replace snapshot health with a generic success indicator. Do not label
 unallocated quota as guaranteed deployable capacity.
+
+## Hosted, read-only mode
+
+The hosted dashboard is the same Operate surface with the same tokens, layout and
+views. `/api/status` reports `read_only`, and the interface then removes every
+control that would change collection instead of disabling it in place:
+
+- The application bar reads **Hosted · read-only**. **Collect now** is replaced
+  by a quiet **Sign out** text link that names the signed-in account in its
+  tooltip.
+- Collection & history keeps its two sections. Scope becomes a read-only list of
+  the collected subscriptions. Morning collection shows the daily time and time
+  zone, the next run, the latest attempt as a status label, the state of the
+  persistent copy and the deployed commit, followed by one sentence explaining
+  that the service collects on its own and is changed through its deployment.
+- Empty states, notices and the stale-data warning point to the hosted schedule
+  and Collection & history, never to Collect now. A failed attempt shows one
+  concise diagnostic, not a traceback.
+- The rail note and footer state that the data is hosted, requires Microsoft
+  Entra sign-in and comes from a specific commit.

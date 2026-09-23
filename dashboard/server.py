@@ -64,6 +64,7 @@ class _HTTPError(Exception):
 class _LocalServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = False
+    bind_address = "127.0.0.1"
 
     def __init__(self, store, collector, static_dir: Path, port: int):
         self.store = store
@@ -74,9 +75,13 @@ class _LocalServer(ThreadingHTTPServer):
         self._status_lock = threading.Lock()
         self._status_cache = None
         self._status_time = 0.0
-        super().__init__(("127.0.0.1", port), _Handler)
+        super().__init__((self.bind_address, port), self.handler_class())
         port = self.server_address[1]
         self.allowed_hosts = frozenset({f"127.0.0.1:{port}", f"localhost:{port}"})
+
+    @staticmethod
+    def handler_class():
+        return _Handler
 
     def server_bind(self):
         if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
@@ -111,21 +116,24 @@ class _LocalServer(ThreadingHTTPServer):
         with self._status_lock:
             self._status_cache = None
 
+    def schedule_status(self, config: dict) -> dict:
+        try:
+            return self.collector.schedule_status()
+        except (RuntimeError, OSError):
+            _LOGGER.exception("Local scheduler status is unavailable.")
+            return {
+                "available": False, "enabled": None,
+                "time": config.get("morning_time"), "task_name": None,
+                "next_run": None, "last_run": None, "last_result": None,
+                "note": "Schedule status is unavailable; check the local server log.",
+                "error": "Unable to read the local scheduler.",
+            }
+
     def status(self) -> dict:
         with self._status_lock:
             if self._status_cache is None or time.monotonic() - self._status_time > 15:
                 config = self.collector.load_config()
-                try:
-                    schedule = self.collector.schedule_status()
-                except (RuntimeError, OSError):
-                    _LOGGER.exception("Local scheduler status is unavailable.")
-                    schedule = {
-                        "available": False, "enabled": None,
-                        "time": config.get("morning_time"), "task_name": None,
-                        "next_run": None, "last_run": None, "last_result": None,
-                        "note": "Schedule status is unavailable; check the local server log.",
-                        "error": "Unable to read the local scheduler.",
-                    }
+                schedule = self.schedule_status(config)
                 self._status_cache = {"config": config, "schedule": schedule}
                 self._status_time = time.monotonic()
             cached = dict(self._status_cache)
@@ -372,16 +380,19 @@ class _Handler(BaseHTTPRequestHandler):
         self.server.invalidate_status()
         self._json(200, result)
 
+    def _dispatch(self):
+        self._security(mutation=self.command == "POST")
+        path, parameters = self._target()
+        if self.command == "GET":
+            self._get(path, parameters)
+        elif self.command == "POST":
+            self._post(path, parameters)
+        else:
+            raise _HTTPError(405, "Only GET and POST are supported.")
+
     def _handle(self):
         try:
-            self._security(mutation=self.command == "POST")
-            path, parameters = self._target()
-            if self.command == "GET":
-                self._get(path, parameters)
-            elif self.command == "POST":
-                self._post(path, parameters)
-            else:
-                raise _HTTPError(405, "Only GET and POST are supported.")
+            self._dispatch()
         except _HTTPError as exc:
             self._json(exc.status, {"error": exc.message})
         except ValueError as exc:

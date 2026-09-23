@@ -1,0 +1,7 @@
+# Build context allowlist: only the hosted service's code enters the image.
+*
+!dashboard/
+!check-foundry-model-availability.ps1
+!run-foundry-subscription-inventory.ps1
+**/__pycache__
+**/*.py[cod]

@@ -2,7 +2,9 @@
 
 Read-only PowerShell scripts and a lightweight localhost dashboard for Microsoft
 Foundry model catalogs, deployment types, subscription quota, and snapshot history.
-The standalone script also supports optional public retail pricing.
+The standalone script also supports optional public retail pricing. An optional
+[hosted, read-only copy](#hosted-dashboard-azure-app-service) runs the same code
+in one Azure web app behind Microsoft Entra sign-in.
 
 This repository contains code and synthetic tests only. It does not contain
 tenant inventory, live subscription identifiers, reports, credentials, or Azure
@@ -18,9 +20,13 @@ authentication state.
 - Subscription-level permissions to read Cognitive Services models and usages.
   Subscription Reader is sufficient for the inventory workflow; follow your
   organization's least-privilege policy. No write or deployment role is needed.
+- Only for the optional hosted dashboard: an Azure subscription where you may
+  create resources and role assignments, the GitHub CLI, and Docker if you want
+  to build and test the container image locally.
 
 These scripts use Azure's commercial-cloud management and pricing endpoints.
-They do not change the default Azure CLI subscription or deploy resources.
+They do not change the default Azure CLI subscription or deploy resources;
+only `scripts\deploy-hosted.ps1` deploys, and only when you run it.
 
 ## Local dashboard
 
@@ -71,8 +77,9 @@ Names such as `foundryquota.127.com` are not inherently local and do not make
 the dashboard accessible from other devices: `127.0.0.1` always means the
 device using the URL. This local dashboard has **no user authentication** and
 must not be exposed through public DNS, port forwarding, or an unprotected
-tunnel. Remote access needs a separate HTTPS and authentication design, such
-as the proposed Entra-protected Azure web app.
+tunnel. For remote access, use the separate
+[hosted dashboard](#hosted-dashboard-azure-app-service), which adds HTTPS and
+Microsoft Entra sign-in and is read-only.
 
 In **Collection & history**, discover subscriptions from a signed-in Azure CLI
 profile, choose a tenant and its subscriptions, and save the scope. Repeat with
@@ -254,11 +261,12 @@ behavior is unchanged. To deliberately return to that behavior, stop collection
 and remove that optional field from the local configuration; removing the field
 does not delete the private profile or its credentials.
 
-The app remains a dependency-light **single-user local** workbench. Anyone can
+The local app remains a dependency-light **single-user** workbench. Anyone can
 clone the code and configure their own tenants, subscriptions and local CLI
 profiles, but they must already have read access to each subscription and
 sign in to each tenant; configuration does not grant Azure access. The local
-web server is not a per-user authenticated service. Only catalog models and
+web server is not a per-user authenticated service; the separate hosted
+dashboard is. Only catalog models and
 quota reported by `Microsoft.CognitiveServices` appear: an absent Claude entry
 does not prove zero quota or entitlement, and reported quota is not a promise
 of deployment capacity.
@@ -288,6 +296,162 @@ Every command accepts `--data-dir` after its command name to use another local
 directory under this checkout's ignored `data` directory, for example
 `--data-dir .\data\archive`. Paths outside `data` are rejected before any files
 are created. Keep all local data private and never force-add it to Git.
+
+## Hosted dashboard (Azure App Service)
+
+An optional, read-only copy of the dashboard for everyone in one Microsoft Entra
+tenant. It runs `python -m dashboard hosted` in a single Linux container on Azure
+App Service, collects the configured subscriptions every morning with its own
+Reader-only managed identity, and shows only builds from `main`. It keeps the
+project lightweight: Python standard library, no database server, no storage
+account, and no stored Azure passwords.
+
+### What gets created
+
+`scripts\deploy-hosted.ps1` deploys `infra\main.bicep` (subscription scope) and
+creates the sign-in app registration. `<suffix>` is a deterministic
+`uniqueString` of the subscription and resource group.
+
+| Resource | Name | Purpose |
+|---|---|---|
+| Resource group | `rg-foundry-inventory` | Holds everything; Central US unless `-Location` is given |
+| Container registry, Basic | `acrfoundryinv<suffix>` | Private images; admin user disabled |
+| App Service plan, B1 Linux | `asp-foundry-inventory-<suffix>` | One small instance |
+| Web app | `app-foundry-inventory-<suffix>` | Custom container on port 8000, HTTPS only, TLS 1.2+, Always On, FTP and basic publishing credentials disabled |
+| User-assigned identity | `id-foundry-inventory-deploy-<suffix>` | GitHub Actions on `main` signs in through OpenID Connect |
+| Entra app registration and service principal | **Foundry inventory** | Single-tenant sign-in with ID tokens and no client secret |
+
+The web app pulls its image with its system-assigned identity. App Service
+authentication requires sign-in on every route and redirects browsers to
+Microsoft Entra. Any member or guest of the tenant can sign in; to allow only
+named people, turn on **Assignment required** for the **Foundry inventory**
+enterprise application and assign them. The same container serves the dashboard
+and runs the daily collection; there is no separate job service.
+
+### Monthly cost
+
+At public list prices (USD, Central US, September 2026): the B1 Linux plan is
+$0.018 per hour, about **$13.14** for 730 hours, and a Basic registry is $0.1666
+per day, about **$5.07** a month with 10 GB of storage included. The total is
+about **$18 a month**. Managed identities, the app registration and role
+assignments have no charge; GitHub-hosted runners are free for public
+repositories. Each deployment adds an image tag, but unchanged layers are shared.
+If registry storage approaches 10 GB, delete old `foundry-inventory` tags.
+
+### Permissions granted
+
+| Identity | Role | Scope |
+|---|---|---|
+| Web app, system-assigned | AcrPull | The registry |
+| Web app, system-assigned | Reader | Each collected subscription |
+| Deploy identity, user-assigned | AcrPush | The registry |
+| Deploy identity, user-assigned | Website Contributor | The web app |
+
+No person receives a new role. The deploy identity's federated credential trusts
+only `repo:<owner>/<repo>:ref:refs/heads/main` from
+`https://token.actions.githubusercontent.com`, so pull requests and other
+branches cannot deploy.
+
+### Deploy
+
+You need rights to create resources and role assignments (for example Owner) on
+the hosting and collected subscriptions, permission to register applications in
+Entra, a dedicated Azure CLI profile that is already signed in, and `gh` signed
+in with rights to set repository secrets. The script never signs in, signs out
+or changes the default subscription, and refuses the default `~/.azure` profile.
+
+```powershell
+.\scripts\deploy-hosted.ps1 -AzureConfigDir .\data\azure-cli `
+    -SubscriptionId "<hosting-subscription-guid>" -ValidateOnly
+.\scripts\deploy-hosted.ps1 -AzureConfigDir .\data\azure-cli `
+    -SubscriptionId "<hosting-subscription-guid>" -SetGitHubSecrets
+```
+
+The scope comes from `data\config.json`: its subscriptions in the hosting
+subscription's tenant, and its morning time. Use `-CollectSubscriptionId` to
+choose subscriptions explicitly, and `-MorningTime`, `-TimeZone`, `-Location`
+or `-ResourceGroupName` to override defaults. `-ValidateOnly` registers the
+`Microsoft.Web` provider when needed, validates the template and prints a
+what-if summary without other changes. A full run creates or updates the app
+registration and its service principal, deploys the template, sets the redirect
+URI `https://<web-app-host>/.auth/login/aad/callback` from the deployed host
+name, and, with `-SetGitHubSecrets`, stores `AZURE_CLIENT_ID`,
+`AZURE_TENANT_ID`, `AZURE_SUBSCRIPTION_ID`, `AZURE_RESOURCE_GROUP`,
+`AZURE_WEBAPP_NAME` and `AZURE_ACR_NAME` as Actions secrets. It prints resource
+names, never tokens.
+
+Until the first build from `main`, the web app shows only App Service's default
+page behind sign-in. Every push to `main` then runs
+`.github/workflows/hosted-dashboard.yml`: tests on Windows, an offline container
+smoke test, then a build pushed as `foundry-inventory:<commit>`. The web app is
+pointed at exactly that tag, and the workflow checks that an unauthenticated
+HTTPS request is redirected to Microsoft Entra sign-in. Deployments run one at a
+time. Pull requests run the tests and the image smoke test without secrets.
+
+### Redeploy, change and tear down
+
+- **New code:** merge to `main`. To redeploy the current commit, re-run its
+  workflow or use **Run workflow** on `main`.
+- **Scope, schedule or infrastructure:** edit the local config or pass
+  parameters, then run the script again. It is idempotent and keeps the image
+  the workflow last deployed. The web app restarts with the new settings.
+- **Collect sooner:** collection runs daily at the configured local time. On
+  start, the service also collects when no complete snapshot exists since the
+  most recent scheduled time, so a restart retries a missed or failed collection.
+- **Tear down:** remove the Reader assignments first, then the resources, the app
+  registration and the secrets:
+
+```powershell
+$env:AZURE_CONFIG_DIR = (Resolve-Path .\data\azure-cli).Path
+$principal = az webapp identity show --resource-group rg-foundry-inventory `
+    --name "<web-app-name>" --subscription "<hosting-subscription-guid>" --query principalId --output tsv
+foreach ($id in "<collected-subscription-guid-1>", "<collected-subscription-guid-2>") {
+    az role assignment delete --assignee $principal --role Reader --scope "/subscriptions/$id"
+}
+az group delete --name rg-foundry-inventory --subscription "<hosting-subscription-guid>"
+az ad app delete --id "<sign-in-app-client-id>"
+"AZURE_CLIENT_ID", "AZURE_TENANT_ID", "AZURE_SUBSCRIPTION_ID", "AZURE_RESOURCE_GROUP",
+    "AZURE_WEBAPP_NAME", "AZURE_ACR_NAME" | ForEach-Object { gh secret delete $_ --repo "<owner>/<repo>" }
+```
+
+Deleting the resource group removes the registry, plan, web app, deploy identity
+and the role assignments inside it. Disable the workflow as well, or the next
+push to `main` fails at Azure sign-in.
+
+### Data handling
+
+- The live SQLite database stays on the container's local disk, because SQLite
+  must not run on App Service's network-backed `/home` share. After each finished
+  collection the service writes a consistent copy with the SQLite backup API to
+  local staging, verifies it, then copies it to
+  `/home/foundry-inventory/inventory.sqlite3` and renames it into place
+  atomically. A new container without a local database restores that copy. An
+  unreadable copy is kept aside, never overwritten.
+- The collection scope is an app setting (`FOUNDRY_INVENTORY_SCOPE`), not part of
+  the repository or image. The image contains code only.
+- Managed-identity sign-in state lives only on the container disk, never in
+  `/home`. The diagnostics of the latest seven collections are kept there.
+- Snapshots are retained, so the database grows with each daily collection;
+  B1 includes 10 GB of `/home` storage. **Collection & history** shows the
+  latest persistent copy.
+- Container logs are kept in `/home/LogFiles` for three days (35 MB). There is no
+  Application Insights resource, and Azure CLI and PowerShell telemetry are off.
+- The server re-checks the App Service identity headers and the tenant on every
+  request, accepts only the web app's host names, and refuses any change over
+  HTTP. External requests cannot set those headers while authentication is on.
+
+### Limits and follow-up
+
+- One tenant. A managed identity reads only its own tenant, so configured
+  subscriptions in other tenants (for example a separate Claude or partner
+  tenant) are skipped and stay in the local dashboard. Collecting them from the
+  hosted service would need cross-tenant app setup, such as a multi-tenant app
+  registration that trusts the web app's identity, plus consent and Reader in
+  the other tenant. That is a follow-up, not part of this deployment.
+- The hosted dashboard is read-only: collection, scope, schedule and discovery
+  are deployment settings, not browser actions.
+- Guests sign in with the same user consent as members. If someone sees **Need
+  admin approval**, a Cloud Application Administrator can grant consent once.
 
 ## Selected models and regions
 
@@ -414,6 +578,8 @@ arbitrary shell commands. This is a single-user local application, not a
 multi-user service: do not put it behind a public proxy or share its port.
 Loopback is not user authentication; other local processes or users can reach
 the service. Use a trusted workstation and protect the local data directory.
+The hosted mode is a separate, read-only server; see its section for its
+authentication and data handling.
 
 CSV content is data from Azure, not executable content. When importing a report
 into spreadsheet software, treat text fields as text and do not enable external
@@ -439,7 +605,17 @@ The harness writes generated fixtures under the ignored `test-output` directory.
 It covers paging, error responses, unknown and zero quota, shared quota pools,
 retirement metadata, pricing units/tiers, and object output. Dashboard tests
 use temporary SQLite databases and mocked collection/scheduling, not live
-subscriptions or task registrations.
+subscriptions or task registrations. Hosted-mode tests simulate App Service
+identity headers and use fake clocks.
+
+The container image has an offline smoke test that needs only Docker. It checks
+sign-in enforcement, read-only routes, the bundled PowerShell and Azure CLI, and
+that a new container restores the `/home` backup:
+
+```powershell
+docker build --build-arg GIT_COMMIT=0123456789abcdef -t foundry-inventory:local .
+python scripts\smoke-test-hosted-image.py --image foundry-inventory:local --commit 0123456789abcdef
+```
 
 ## API references
 

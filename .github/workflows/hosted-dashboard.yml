@@ -1,0 +1,151 @@
+# Pull requests: tests and an offline image smoke test, with no secrets.
+# main: the same checks, then build and push an image tagged with the commit,
+# point the web app at exactly that tag and verify the HTTPS sign-in redirect.
+name: Hosted dashboard
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Tests (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+      - name: Python and browser-logic tests
+        run: python -m unittest discover -s tests -p 'test_dashboard_*.py'
+      - name: JavaScript syntax
+        run: |
+          foreach ($file in Get-ChildItem dashboard/static/*.js) {
+            node --check $file.FullName
+            if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          }
+      - name: PowerShell script syntax
+        run: |
+          $failed = $false
+          foreach ($file in Get-ChildItem -Recurse -Filter *.ps1 -Path . -File) {
+            $tokens = $null; $errors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile($file.FullName, [ref]$tokens, [ref]$errors)
+            foreach ($problem in $errors) { Write-Error "$($file.Name): $problem"; $failed = $true }
+          }
+          if ($failed) { exit 1 }
+      - name: Report fixtures (PowerShell 7)
+        run: pwsh -NoProfile -File .\tests\test-foundry-report.ps1
+      - name: Report fixtures (Windows PowerShell 5.1)
+        run: powershell -NoProfile -File .\tests\test-foundry-report.ps1
+
+  image:
+    name: Container image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Bicep build
+        run: |
+          az bicep install --only-show-errors
+          az bicep build --file infra/main.bicep --stdout > /dev/null
+      - uses: docker/setup-buildx-action@v4
+      - name: Build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          load: true
+          tags: foundry-inventory:ci
+          build-args: GIT_COMMIT=${{ github.sha }}
+          provenance: false
+          sbom: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Offline smoke test
+        run: >-
+          python3 scripts/smoke-test-hosted-image.py --image foundry-inventory:ci
+          --commit "$GITHUB_SHA" --home "$RUNNER_TEMP/smoke-home"
+
+  deploy:
+    name: Deploy main
+    needs: [test, image]
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    concurrency:
+      group: hosted-dashboard-deploy
+      cancel-in-progress: false
+    env:
+      AZURE_RESOURCE_GROUP: ${{ secrets.AZURE_RESOURCE_GROUP }}
+      AZURE_WEBAPP_NAME: ${{ secrets.AZURE_WEBAPP_NAME }}
+      AZURE_ACR_NAME: ${{ secrets.AZURE_ACR_NAME }}
+      AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Azure sign-in (OpenID Connect, no stored password)
+        uses: azure/login@v3
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      - name: Registry sign-in
+        run: az acr login --name "$AZURE_ACR_NAME" --only-show-errors
+      - uses: docker/setup-buildx-action@v4
+      - name: Build and push ${{ github.sha }}
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: true
+          tags: ${{ secrets.AZURE_ACR_NAME }}.azurecr.io/foundry-inventory:${{ github.sha }}
+          build-args: GIT_COMMIT=${{ github.sha }}
+          provenance: false
+          sbom: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Point the web app at this commit
+        run: |
+          image="${AZURE_ACR_NAME}.azurecr.io/foundry-inventory:${GITHUB_SHA}"
+          az webapp config set --resource-group "$AZURE_RESOURCE_GROUP" --name "$AZURE_WEBAPP_NAME" \
+            --linux-fx-version "DOCKER|${image}" --output none --only-show-errors
+          actual="$(az webapp config show --resource-group "$AZURE_RESOURCE_GROUP" --name "$AZURE_WEBAPP_NAME" \
+            --query linuxFxVersion --output tsv --only-show-errors)"
+          if [ "$actual" != "DOCKER|${image}" ]; then
+            echo "::error::The web app does not reference the image for ${GITHUB_SHA}."
+            exit 1
+          fi
+          echo "The web app now runs foundry-inventory:${GITHUB_SHA}."
+      - name: Verify the HTTPS sign-in redirect
+        run: |
+          host="$(az webapp show --resource-group "$AZURE_RESOURCE_GROUP" --name "$AZURE_WEBAPP_NAME" \
+            --query defaultHostName --output tsv --only-show-errors)"
+          echo "::add-mask::${host}"
+          login="https://login.microsoftonline.com/${AZURE_TENANT_ID}/"
+          # App Service authentication redirects browsers and challenges other clients with 401.
+          agent="Mozilla/5.0 (X11; Linux x86_64) foundry-inventory-deploy-check"
+          for attempt in $(seq 1 40); do
+            url="https://${host}/"
+            for hop in 1 2 3; do
+              result="$(curl --silent --show-error --output /dev/null --max-time 30 --user-agent "$agent" \
+                --write-out '%{http_code} %{redirect_url}' "$url" || true)"
+              code="${result%% *}"
+              location="${result#* }"
+              if [ "$code" = "302" ] && [ "${location#"$login"}" != "$location" ]; then
+                echo "Unauthenticated HTTPS requests redirect to Microsoft Entra sign-in for the tenant."
+                exit 0
+              fi
+              if [ "$code" = "302" ] && [ "${location#https://${host}/}" != "$location" ]; then
+                url="$location"
+                continue
+              fi
+              break
+            done
+            echo "Attempt ${attempt}: HTTP ${code}; waiting for the web app to restart."
+            sleep 15
+          done
+          echo "::error::The web app did not answer with the Microsoft Entra sign-in redirect."
+          exit 1
