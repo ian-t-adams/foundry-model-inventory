@@ -20,6 +20,62 @@ def luminance(color):
 
 
 class FrontendTests(unittest.TestCase):
+    @unittest.skipUnless(shutil.which("node"), "Node is optional; required only for this browser-logic unit test")
+    def test_collection_scope_keeps_other_tenants_and_their_profiles(self):
+        script = r"""
+const fs = require("node:fs");
+const vm = require("node:vm");
+const assert = require("node:assert/strict");
+const source = fs.readFileSync(process.argv[1], "utf8")
+  .replace(/^import .*\r?\n/, "")
+  .replace(/\r?\nboot\(\);\s*$/, "");
+const context = {};
+vm.runInNewContext(source, context);
+const primary = {
+  tenant_id: "tenant-a",
+  azure_config_dir: "D:\\fixture\\data\\primary",
+  subscriptions: [{ id: "sub-a", name: "First" }],
+  morning_time: "07:00",
+};
+const added = context.collectionPayload(
+  primary, "tenant-b", [{ id: "sub-b", name: "Second" }],
+  "D:\\fixture\\data\\secondary", "08:00"
+);
+assert.deepEqual(JSON.parse(JSON.stringify(added.subscriptions)), [
+  { id: "sub-a", name: "First" },
+  { id: "sub-b", name: "Second", tenant_id: "tenant-b" },
+]);
+assert.equal(added.tenant_id, primary.tenant_id);
+assert.equal(added.azure_config_dir, primary.azure_config_dir);
+assert.equal(added.tenant_profiles["tenant-b"], "D:\\fixture\\data\\secondary");
+assert.equal(added.morning_time, "08:00");
+assert.equal(primary.subscriptions.length, 1);
+assert.equal(context.collectionProfile(added, "tenant-b"), "D:\\fixture\\data\\secondary");
+assert.equal(context.collectionProfile(added, "tenant-a"), primary.azure_config_dir);
+const edited = context.collectionPayload(
+  added, "tenant-a", [{ id: "sub-c", name: "Third" }], primary.azure_config_dir, "08:00"
+);
+assert.deepEqual(JSON.parse(JSON.stringify(edited.subscriptions)), [
+  { id: "sub-b", name: "Second", tenant_id: "tenant-b" },
+  { id: "sub-c", name: "Third" },
+]);
+assert.equal(edited.tenant_profiles["tenant-b"], "D:\\fixture\\data\\secondary");
+assert.throws(() => context.collectionPayload(
+  primary, "tenant-b", [{ id: "sub-b", name: "Second" }], "", "07:00"
+), /private Azure CLI profile/);
+const initial = context.collectionPayload(
+  { tenant_id: "", subscriptions: [], morning_time: "07:00" },
+  "tenant-new", [{ id: "sub-new", name: "New" }], "", "07:00"
+);
+assert.equal(initial.tenant_id, "tenant-new");
+assert.equal(initial.subscriptions[0].tenant_id, undefined);
+"""
+        result = subprocess.run(
+            [shutil.which("node"), "-e", script, str(STATIC / "app.js")],
+            text=True, capture_output=True, timeout=30, check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_semantic_text_and_chart_contrast_in_both_themes(self):
         css = (STATIC / "styles.css").read_text(encoding="utf-8")
         light = re.search(r":root\s*\{([^}]+)\}", css).group(1)

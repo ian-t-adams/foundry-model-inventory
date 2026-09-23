@@ -1,17 +1,17 @@
 import { MultiSelect, closeMultiSelects } from "./controls.js";
 
 const $ = (id) => document.getElementById(id);
-const multiKeys = ["subscription", "region", "family", "model", "model_version", "deployment_type",
+const multiKeys = ["tenant", "subscription", "region", "family", "model", "model_version", "deployment_type",
   "capacity_type", "availability", "lifecycle", "unit"];
 const filterKeys = [...multiKeys, "version", "minimum", "quota_name", "sku"];
 const filterLabels = {
-  subscription: "Subscription", region: "Region", family: "Family", model: "Model",
+  tenant: "Tenant", subscription: "Subscription", region: "Region", family: "Family", model: "Model",
   model_version: "Model + version", version: "Legacy version", deployment_type: "Geography", capacity_type: "Capacity",
   availability: "Headroom", lifecycle: "Lifecycle", unit: "Unit", minimum: "Minimum",
   quota_name: "Quota pool", sku: "SKU",
 };
 const defaultOptions = {
-  subscription: "All subscriptions", region: "All regions", family: "All families",
+  tenant: "All tenants", subscription: "All subscriptions", region: "All regions", family: "All families",
   model: "All models", model_version: "Choose a model first", deployment_type: "All geographies",
   capacity_type: "All capacity types", availability: "Any quota state",
   lifecycle: "All lifecycle states", unit: "All units",
@@ -21,7 +21,8 @@ const viewNames = { quota: "quota entries", deployments: "catalog options", fami
 const state = {
   filters: {}, snapshot: "latest", page: 1, pageSize: 50, sort: "remaining", direction: "desc",
   q: "", tab: "inventory", csrf: "", status: null, scans: [], rows: [],
-  subscriptions: [], config: null, request: 0, compareRequest: 0, comparePage: 1, initialized: false,
+  subscriptions: [], config: null, discoveredProfiles: new Map(),
+  request: 0, compareRequest: 0, comparePage: 1, initialized: false,
   facets: {}, view: "quota", trail: [], chartVisible: true,
 };
 const numberFormat = new Intl.NumberFormat(undefined, { maximumFractionDigits: 3 });
@@ -948,6 +949,8 @@ function applyStatus(data) {
     notice("Choose your tenant and subscriptions in Collection & history before starting a scan.", "");
   } else if (data.collection?.last_error && !collecting) {
     notice(`The last collection needs attention: ${data.collection.last_error}. The latest complete snapshot is still available.`, "error");
+  } else if (data.scope_pending && !collecting) {
+    notice("The latest complete snapshot does not cover the current tenant and subscription selection. Collect now to refresh the full scope.", "warning");
   } else if (data.latest && Date.now() - new Date(data.latest.started_at).getTime() > 30 * 60 * 60 * 1000) {
     notice("The latest complete snapshot is more than 30 hours old. Collect now or check the morning schedule.", "warning");
   } else {
@@ -976,27 +979,68 @@ function renderSchedule(schedule) {
   }
 }
 
-function renderConfig(config) {
+function collectionTenant(config, subscription) {
+  return subscription.tenant_id || config?.tenant_id || "";
+}
+
+function collectionProfile(config, tenant) {
+  if (!tenant) return "";
+  return tenant === config?.tenant_id ? config?.azure_config_dir || "" :
+    config?.tenant_profiles?.[tenant] || "";
+}
+
+function collectionPayload(config, tenant, subscriptions, profile, morningTime) {
+  if (!tenant || !subscriptions.length) throw new Error("Select a tenant and at least one enabled subscription.");
+  const primary = config?.tenant_id || tenant;
+  if (tenant !== primary && !profile) {
+    throw new Error("An additional tenant needs an explicit private Azure CLI profile.");
+  }
+  const retained = (config?.subscriptions || []).filter((item) => collectionTenant(config, item) !== tenant);
+  const selected = subscriptions.map(({ id, name }) =>
+    tenant === primary ? { id, name } : { id, name, tenant_id: tenant });
+  const updated = {
+    tenant_id: primary,
+    subscriptions: [...retained, ...selected],
+    morning_time: morningTime || config?.morning_time || "07:00",
+  };
+  const primaryProfile = tenant === primary ? profile || config?.azure_config_dir : config?.azure_config_dir;
+  if (primaryProfile) updated.azure_config_dir = primaryProfile;
+  const profiles = { ...config?.tenant_profiles };
+  if (tenant !== primary) profiles[tenant] = profile;
+  if (Object.keys(profiles).length) updated.tenant_profiles = profiles;
+  return updated;
+}
+
+function renderConfig(config, preferredTenant) {
   state.config = config;
   if (!config) return;
-  const selected = new Set((config.subscriptions || []).map((sub) => sub.id));
+  const previousTenant = preferredTenant || $("tenant-select").value;
   for (const sub of config.subscriptions || []) {
     if (!state.subscriptions.some((item) => item.id === sub.id)) {
-      state.subscriptions.push({ ...sub, tenant_id: config.tenant_id, state: "Enabled" });
+      state.subscriptions.push({ ...sub, tenant_id: collectionTenant(config, sub), state: "Enabled" });
     }
   }
   const tenants = [...new Set(state.subscriptions.map((sub) => sub.tenant_id))].sort();
-  populateSelect($("tenant-select"), tenants, "Select tenant", config.tenant_id);
-  renderSubscriptionChoices(selected);
+  const selectedTenant = tenants.includes(previousTenant) ? previousTenant : config.tenant_id || tenants[0];
+  populateSelect($("tenant-select"), tenants, "Select tenant", selectedTenant);
+  $("profile-directory").value = state.discoveredProfiles.get(selectedTenant) ??
+    collectionProfile(config, selectedTenant);
+  const scope = config.subscriptions || [];
+  const tenantCount = new Set(scope.map((sub) => collectionTenant(config, sub))).size;
+  $("scope-summary").textContent = scope.length ?
+    `${tenantCount} tenant${tenantCount === 1 ? "" : "s"} · ${scope.length} subscription${scope.length === 1 ? "" : "s"} saved for collection.` :
+    "Discover subscriptions with your Azure CLI sign-in, then save the scope.";
+  renderSubscriptionChoices();
 }
 
 function renderSubscriptionChoices(selectedIds) {
-  const selected = selectedIds || new Set([...$("subscription-choices").querySelectorAll("input:checked")].map((input) => input.value));
   const tenant = $("tenant-select").value;
+  const selected = selectedIds || new Set((state.config?.subscriptions || [])
+    .filter((sub) => collectionTenant(state.config, sub) === tenant).map((sub) => sub.id));
   const available = state.subscriptions.filter((sub) => sub.tenant_id === tenant && sub.state === "Enabled");
   const container = $("subscription-choices");
   container.replaceChildren();
-  if (!available.length) container.append(el("p", "muted", "No enabled subscriptions for this tenant. Discover subscriptions after signing in with Azure CLI."));
+  if (!available.length) container.append(el("p", "muted", "No enabled subscriptions in this profile. Sign in with Azure CLI, then discover again."));
   for (const sub of available.sort((a, b) => a.name.localeCompare(b.name))) {
     const label = el("label", "checkbox-label");
     const input = el("input");
@@ -1308,29 +1352,51 @@ function wireEvents() {
     button.disabled = true;
     button.textContent = "Discovering…";
     try {
-      state.subscriptions = (await api("/api/subscriptions")).subscriptions;
-      renderConfig(state.config || { tenant_id: "", subscriptions: [] });
-      toast(`Found ${state.subscriptions.length} subscriptions in your Azure CLI profile.`);
+      const profile = $("profile-directory").value.trim();
+      const found = (await (profile ?
+        api("/api/subscriptions", { azure_config_dir: profile }) :
+        api("/api/subscriptions"))).subscriptions;
+      for (const sub of found) {
+        state.discoveredProfiles.set(sub.tenant_id, profile);
+        const existing = state.subscriptions.findIndex((item) => item.id === sub.id);
+        if (existing === -1) state.subscriptions.push(sub);
+        else state.subscriptions[existing] = sub;
+      }
+      const foundTenants = [...new Set(found.map((sub) => sub.tenant_id))];
+      renderConfig(state.config || { tenant_id: "", subscriptions: [], morning_time: "07:00" },
+        foundTenants.length === 1 ? foundTenants[0] : $("tenant-select").value);
+      toast(`Found ${found.length} subscriptions in this Azure CLI profile.`);
     } finally {
       button.disabled = false;
       button.textContent = "Discover subscriptions";
     }
   }));
-  $("tenant-select").addEventListener("change", () => renderSubscriptionChoices(new Set()));
+  $("tenant-select").addEventListener("change", () => {
+    const tenant = $("tenant-select").value;
+    $("profile-directory").value = state.discoveredProfiles.get(tenant) ??
+      collectionProfile(state.config, tenant);
+    renderSubscriptionChoices();
+  });
   $("config-form").addEventListener("submit", (event) => {
     event.preventDefault();
     handled(async () => {
       const ids = new Set([...$("subscription-choices").querySelectorAll("input:checked")].map((input) => input.value));
-      const subscriptions = state.subscriptions.filter((sub) => ids.has(sub.id))
+      const tenant = $("tenant-select").value;
+      const subscriptions = state.subscriptions.filter((sub) => sub.tenant_id === tenant && ids.has(sub.id))
         .map((sub) => ({ id: sub.id, name: sub.name }));
-      if (!$("tenant-select").value || !subscriptions.length) throw new Error("Select a tenant and at least one enabled subscription.");
-      const config = await api("/api/config", {
-        tenant_id: $("tenant-select").value, subscriptions,
-        morning_time: $("schedule-time").value || "07:00",
-      });
-      renderConfig(config.config || config);
+      const profile = $("profile-directory").value.trim();
+      if (profile !== collectionProfile(state.config, tenant) &&
+          profile !== state.discoveredProfiles.get(tenant)) {
+        throw new Error("Discover this tenant's subscriptions using the selected Azure CLI profile first.");
+      }
+      const payload = collectionPayload(
+        state.config, tenant, subscriptions, profile, $("schedule-time").value,
+      );
+      const config = await api("/api/config", payload);
+      state.discoveredProfiles.delete(tenant);
+      renderConfig(config.config || config, tenant);
       applyStatus(await api("/api/status"));
-      toast("Collection scope saved locally.");
+      toast("Tenant scope saved locally. Collect now to refresh the full estate.");
     })();
   });
   $("schedule-form").addEventListener("submit", (event) => {

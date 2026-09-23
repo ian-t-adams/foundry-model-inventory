@@ -13,7 +13,8 @@ authentication state.
 - Windows PowerShell 5.1 or PowerShell 7.
 - Python 3.11 or newer for the dashboard. It uses only the Python standard
   library: no package installation, frontend build, or database service.
-- Azure CLI, signed in with `az login --tenant "<tenant-guid>"`.
+- Azure CLI, signed in for each tenant you collect. Use a separate private
+  profile per tenant when accounts or sign-ins differ.
 - Subscription-level permissions to read Cognitive Services models and usages.
   Subscription Reader is sufficient for the inventory workflow; follow your
   organization's least-privilege policy. No write or deployment role is needed.
@@ -73,12 +74,14 @@ must not be exposed through public DNS, port forwarding, or an unprotected
 tunnel. Remote access needs a separate HTTPS and authentication design, such
 as the proposed Entra-protected Azure web app.
 
-In **Collection & history**, discover the subscriptions from your existing Azure
-CLI sign-in, choose one tenant and the subscriptions to collect, and save the
-scope. **Collect now** starts a read-only estate scan. You can keep browsing the
-previous snapshot while it runs.
+In **Collection & history**, discover subscriptions from a signed-in Azure CLI
+profile, choose a tenant and its subscriptions, and save the scope. Repeat with
+a separate profile to add another tenant without replacing the first one.
+**Collect now** scans every configured subscription into one read-only estate
+snapshot. You can keep browsing the previous snapshot while it runs; the
+dashboard warns if that snapshot does not yet include the current scope.
 
-The inventory supports subscription, region, model family, exact model/version,
+The inventory supports tenant, subscription, region, model family, exact model/version,
 deployment geography, PAYG/PTU/batch, lifecycle, and remaining-quota filters.
 Categorical filters are searchable, checkbox-based multi-selects: selections
 within a filter are matched with **OR**, and different filters combine with
@@ -141,7 +144,9 @@ Data lives under the ignored `data` directory:
 
 The newest **complete** snapshot is the default view. Partial and failed attempts
 remain visible in collection history and do not silently replace it. Historical
-snapshots are retained; there is no automatic deletion policy.
+snapshots are retained; there is no automatic deletion policy. After adding or
+removing subscriptions, the prior complete snapshot still reflects its original
+scope until a new complete collection finishes.
 
 ### Every-morning collection
 
@@ -156,11 +161,11 @@ python -m dashboard schedule --disable
 ```
 
 The task runs as your current Windows user with limited privileges and no stored
-password. You must be signed into Windows, and your Azure CLI sign-in must still
-be valid. Missed runs use Task Scheduler's start-when-available behavior. If
-authentication expires, run `az login --tenant "<tenant-guid>"` again; failures
-are recorded rather than ingested as an empty estate. Overlapping scheduled and
-manual collections are blocked.
+password. You must be signed into Windows, and each tenant's selected Azure CLI
+profile must still be valid. Missed runs use Task Scheduler's
+start-when-available behavior. If authentication expires, sign in again to the
+affected profile and tenant; failures are recorded rather than ingested as an
+empty estate. Overlapping scheduled and manual collections are blocked.
 
 If collection reports **does not exist in MSAL token cache**, Azure CLI still
 has subscription metadata but no usable cached sign-in for the selected account.
@@ -179,7 +184,7 @@ The dashboard never opens a sign-in flow automatically.
 The schedule collects data; it does not launch the browser or expose a web
 server. Start the dashboard whenever you want to explore the latest data.
 
-### Optional isolated Azure CLI profile
+### Isolated Azure CLI profiles and additional tenants
 
 For multiple accounts or tenants, keep inventory authentication separate from
 your shared Azure CLI profile. From the checkout, create a new private profile
@@ -192,7 +197,8 @@ if (Test-Path -LiteralPath $profileDirectory) {
 }
 $null = New-Item -ItemType Directory -Path $profileDirectory
 $env:AZURE_CONFIG_DIR = (Resolve-Path -LiteralPath $profileDirectory).Path
-az config set core.enable_broker_on_windows=false core.login_experience_v2=off
+az config set core.enable_broker_on_windows=false
+az config set core.login_experience_v2=off
 az login --tenant "<tenant-guid>"
 ```
 
@@ -207,17 +213,55 @@ python -m dashboard configure `
 ```
 
 The absolute profile path is saved as `azure_config_dir` in `data\config.json`.
-Subscription discovery, **Collect now**, and scheduled collection all use it,
-even when launched from a different terminal. Saving scope or schedule settings
-does not drop the profile selection. The directory must remain under this
-checkout's ignored `data` directory; if it disappears, collection fails rather
-than falling back to shared credentials. Protect it like any credential store,
-and never publish or force-add it to Git.
+To add a different tenant, create another private directory under `data`, set
+`AZURE_CONFIG_DIR` to that directory **in your sign-in terminal only**, and
+run `az login --tenant "<additional-tenant-guid>"`. Verify an authorized read
+before adding it:
+
+```powershell
+az provider show --namespace Microsoft.CognitiveServices `
+    --subscription "<additional-subscription-guid>" `
+    --query namespace --output tsv
+```
+
+In **Collection & history**, enter the new absolute profile directory, choose
+**Discover subscriptions**, select the new tenant and its subscriptions, then
+choose **Save tenant scope** and **Collect now**. The existing tenants stay
+configured. Or use the command line after signing in to the new profile:
+
+```powershell
+python -m dashboard configure --add `
+    --tenant-id "<additional-tenant-guid>" `
+    --subscription-id "<additional-subscription-guid>" `
+    --azure-config-dir $env:AZURE_CONFIG_DIR
+python -m dashboard collect
+```
+
+The private configuration stores a `tenant_id` on each additional-tenant
+subscription and its profile directory under `tenant_profiles`. Discovery,
+manual collection, and the morning task use the appropriate profile for each
+subscription, including after restarting the dashboard or logging in through
+a different terminal. Saving the primary tenant's scope or the schedule does
+not drop additional tenants. Profile paths must stay under this checkout's
+ignored `data` directory; if one is unavailable, that subscription fails
+explicitly instead of using the shared CLI credentials. Other subscriptions
+that were observed successfully are retained as a **partial** attempt, and
+the last complete snapshot remains selected. Protect these directories like
+credentials, and never publish or force-add them to Git.
 
 When `azure_config_dir` is absent, existing Azure CLI environment/default-profile
 behavior is unchanged. To deliberately return to that behavior, stop collection
 and remove that optional field from the local configuration; removing the field
 does not delete the private profile or its credentials.
+
+The app remains a dependency-light **single-user local** workbench. Anyone can
+clone the code and configure their own tenants, subscriptions and local CLI
+profiles, but they must already have read access to each subscription and
+sign in to each tenant; configuration does not grant Azure access. The local
+web server is not a per-user authenticated service. Only catalog models and
+quota reported by `Microsoft.CognitiveServices` appear: an absent Claude entry
+does not prove zero quota or entitlement, and reported quota is not a promise
+of deployment capacity.
 
 ### Import an existing snapshot or use the command line
 

@@ -38,11 +38,13 @@ def parser() -> argparse.ArgumentParser:
         elif name == "configure":
             command.add_argument("--tenant-id", required=True)
             command.add_argument("--subscription-id", nargs="+", required=True)
-            command.add_argument("--morning-time", default="07:00")
+            command.add_argument("--morning-time")
             command.add_argument(
                 "--azure-config-dir", type=Path,
                 help="Existing private Azure CLI profile directory under this checkout's data directory",
             )
+            command.add_argument("--add", action="store_true",
+                                 help="Add subscriptions without replacing the configured estate")
         elif name == "schedule":
             action = command.add_mutually_exclusive_group()
             action.add_argument("--enable", action="store_true")
@@ -93,6 +95,11 @@ def main(argv: list[str] | None = None) -> int:
             summary = collector.run_scan(source=args.source)
         elif args.command == "configure":
             profile = str(args.azure_config_dir.resolve()) if args.azure_config_dir is not None else None
+            if args.add and profile is None:
+                raise ValueError("--add requires --azure-config-dir for the tenant being added.")
+            previous = collector.load_config() if args.add else None
+            if args.add and not previous["subscriptions"]:
+                raise ValueError("Configure a primary tenant before adding another tenant.")
             subscriptions = (
                 collector.discover_subscriptions(profile) if profile is not None
                 else collector.discover_subscriptions()
@@ -107,12 +114,44 @@ def main(argv: list[str] | None = None) -> int:
             ]
             if len(selected) != len(requested):
                 raise ValueError("One or more subscriptions are unavailable, disabled, or belong to another tenant.")
-            config = {
-                "tenant_id": args.tenant_id, "subscriptions": selected, "morning_time": args.morning_time,
-            }
-            if profile is not None:
-                config["azure_config_dir"] = profile
-            summary = collector.save_config(config)
+            if args.add:
+                if args.morning_time and args.morning_time != previous["morning_time"]:
+                    raise ValueError("Change the morning collection time with the schedule command.")
+                config = dict(previous)
+                primary = previous["tenant_id"]
+                target = args.tenant_id.lower()
+                existing = {item["id"]: item for item in previous["subscriptions"]}
+                if target == primary:
+                    if profile != previous.get("azure_config_dir"):
+                        raise ValueError("Adding to the primary tenant requires its configured Azure CLI profile.")
+                else:
+                    existing_profile = previous.get("tenant_profiles", {}).get(target)
+                    if existing_profile and profile != existing_profile:
+                        raise ValueError(
+                            "Adding subscriptions cannot change an existing tenant's Azure CLI profile."
+                        )
+                    config["tenant_profiles"] = {
+                        **previous.get("tenant_profiles", {}), target: profile,
+                    }
+                for item in selected:
+                    old = existing.get(item["id"])
+                    if old and old.get("tenant_id", primary) != target:
+                        raise ValueError("A subscription cannot be moved to another tenant.")
+                    existing[item["id"]] = (
+                        item if target == primary else {**item, "tenant_id": target}
+                    )
+                config["subscriptions"] = list(existing.values())
+            else:
+                config = {
+                    "tenant_id": args.tenant_id, "subscriptions": selected,
+                    "morning_time": args.morning_time or "07:00",
+                }
+                if profile is not None:
+                    config["azure_config_dir"] = profile
+            summary = (
+                collector.save_config(config, expected_config=previous)
+                if args.add else collector.save_config(config)
+            )
         else:
             summary = (
                 collector.set_schedule(args.enable, args.time)

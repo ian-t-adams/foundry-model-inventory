@@ -24,7 +24,7 @@ collection settings are adjacent views, not a separate application.
 ## Structure
 
 The 66px application bar holds identity and collection. A 248px filter rail
-holds scope, model and deployment filters plus browser-local saved views.
+holds tenant, subscription, model and deployment filters plus browser-local saved views.
 The main area contains a snapshot selector, three view tabs, a compact summary,
 and the inventory table. A compact, clickable bar chart and grouped table views
 expose family -> model -> model/version -> deployment options. Breadcrumbs
@@ -52,6 +52,11 @@ Version selection uses complete model/version pairs rather than independent
 sets of model names and version strings. It is a dependent step: choose model
 names first, then their versions. Changing parent models resets version choices
 without clearing unrelated scope filters.
+
+Collection settings use an explicit private CLI profile to discover each tenant.
+Saving a tenant's subscription choices preserves other configured tenants.
+The status surface distinguishes the configured scope from an older complete
+snapshot that does not yet contain it.
 
 Do not replace snapshot health with a generic success indicator. Do not label
 unallocated quota as guaranteed deployable capacity.

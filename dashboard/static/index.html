@@ -45,6 +45,7 @@ FORM: Instrument workbench, grounded direction 6, seed 247d456d. Historical stat
       </div>
       <p class="rail-description">Choose any combination. Selections within a filter are matched with “or”.</p>
       <form id="filters-form" class="filter-form">
+        <div id="filter-tenant"></div>
         <div id="filter-subscription"></div>
         <div id="filter-region"></div>
         <div id="filter-family"></div>
@@ -183,11 +184,13 @@ FORM: Instrument workbench, grounded direction 6, seed 247d456d. Historical stat
         <div class="collection-layout">
           <section class="settings-section" aria-labelledby="scope-title">
             <div class="section-heading compact"><h3 id="scope-title">Collection scope</h3><button id="discover-button" class="button small" type="button">Discover subscriptions</button></div>
-            <p class="muted">Uses the subscriptions available to your current Azure CLI sign-in.</p>
+            <p id="scope-summary" class="muted" aria-live="polite">Discover subscriptions with your Azure CLI sign-in, then save the scope.</p>
             <form id="config-form">
+              <label>Azure CLI profile directory<input id="profile-directory" type="text" autocomplete="off" spellcheck="false" placeholder="Configured or default CLI profile if empty"></label>
+              <p class="muted scope-hint">For another tenant, sign in with a separate profile under this checkout’s private data directory, then discover its subscriptions. Your other tenants stay selected.</p>
               <label>Tenant<select id="tenant-select"><option value="">Discover or load a tenant</option></select></label>
               <fieldset class="subscription-picker"><legend>Subscriptions to collect</legend><div id="subscription-choices"><p class="muted">No collection scope configured.</p></div></fieldset>
-              <button class="button primary" type="submit">Save collection scope</button>
+              <button class="button primary" type="submit">Save tenant scope</button>
             </form>
           </section>
           <section class="settings-section" aria-labelledby="schedule-title">

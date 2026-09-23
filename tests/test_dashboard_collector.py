@@ -15,12 +15,15 @@ from unittest import mock
 from uuid import uuid4
 
 from dashboard.collector import Collector, TASK_NAME, _FileLock, _atomic_json
+from dashboard.store import Store
 
 
 ROOT = Path(__file__).resolve().parents[1]
 TENANT = "10000000-0000-4000-8000-000000000001"
+OTHER_TENANT = "10000000-0000-4000-8000-000000000002"
 SUB_A = "20000000-0000-4000-8000-000000000001"
 SUB_B = "20000000-0000-4000-8000-000000000002"
+SUB_C = "20000000-0000-4000-8000-000000000003"
 FIELDS = [
     "Subscription", "SubscriptionId", "TenantId", "ScanStartedUtc", "Model", "Version",
     "Region", "Type", "SKU", "Catalog", "Lifecycle", "Limit", "Allocated", "Remaining",
@@ -210,6 +213,244 @@ class CollectorCase(CollectorFixture):
         self.assertEqual(saved["azure_config_dir"], str(profile.resolve()))
         restarted = Collector(self.store, self.repo, self.data)
         self.assertEqual(restarted.load_config(), saved)
+
+    def test_additional_tenant_scope_is_validated_and_legacy_saves_preserve_it(self):
+        profile = self.data / "other-tenant-profile"
+        profile.mkdir()
+        additional = {"id": SUB_C, "name": "Other tenant", "tenant_id": OTHER_TENANT}
+        config = {
+            **self.config(),
+            "subscriptions": [*self.config()["subscriptions"], additional],
+            "tenant_profiles": {OTHER_TENANT: str(profile)},
+        }
+        normalized = self.collector.save_config(config)
+        self.assertEqual(normalized["subscriptions"][-1], additional)
+        self.assertEqual(normalized["tenant_profiles"], {OTHER_TENANT: str(profile.resolve())})
+        legacy_save = self.collector.save_config({**self.config(), "morning_time": "08:00"})
+        self.assertEqual(legacy_save["subscriptions"], normalized["subscriptions"])
+        self.assertEqual(legacy_save["tenant_profiles"], normalized["tenant_profiles"])
+        self.assertEqual(Collector(self.store, self.repo, self.data).load_config(), legacy_save)
+
+    def test_additional_tenant_requires_explicit_private_profile_and_unique_subscriptions(self):
+        profile = self.data / "other-tenant-profile"
+        profile.mkdir()
+        additional = {"id": SUB_C, "name": "Other tenant", "tenant_id": OTHER_TENANT}
+        cases = [
+            {"subscriptions": [*self.config()["subscriptions"], additional]},
+            {"subscriptions": [*self.config()["subscriptions"], additional],
+             "tenant_profiles": {OTHER_TENANT: str(self.repo)}},
+            {"subscriptions": [*self.config()["subscriptions"], additional],
+             "tenant_profiles": {TENANT: str(profile)}},
+            {"subscriptions": [*self.config()["subscriptions"], additional],
+             "tenant_profiles": {OTHER_TENANT: str(profile), SUB_B: str(profile)}},
+            {"subscriptions": [*self.config()["subscriptions"], {**additional, "id": SUB_A}],
+             "tenant_profiles": {OTHER_TENANT: str(profile)}},
+            {"subscriptions": [*self.config()["subscriptions"], {**additional, "tenant_id": "bad"}],
+             "tenant_profiles": {OTHER_TENANT: str(profile)}},
+            {"subscriptions": [*self.config()["subscriptions"], {**additional, "command": "whoami"}],
+             "tenant_profiles": {OTHER_TENANT: str(profile)}},
+        ]
+        for case in cases:
+            with self.subTest(case=case), self.assertRaises(ValueError):
+                self.collector.save_config({**self.config(), **case})
+        self.assertFalse(self.collector.config_path.exists())
+
+    def test_legacy_save_with_invalid_subscription_id_is_rejected_not_crashed(self):
+        extra = self.data / "additional-profile"
+        extra.mkdir()
+        self.collector.save_config({
+            **self.config(),
+            "subscriptions": [
+                *self.config()["subscriptions"],
+                {"id": SUB_C, "name": "Other tenant", "tenant_id": OTHER_TENANT},
+            ],
+            "tenant_profiles": {OTHER_TENANT: str(extra)},
+        })
+        for identifier in (["not-a-guid"], 123, None):
+            with self.subTest(identifier=identifier), self.assertRaises(ValueError):
+                self.collector.save_config({
+                    **self.config(),
+                    "subscriptions": [{"id": identifier, "name": "Invalid"}],
+                })
+        self.assertEqual(len(self.collector.load_config()["subscriptions"]), 2)
+
+    def test_additional_tenant_save_rejects_scope_changed_during_discovery(self):
+        previous = self.configure()
+        changed = self.collector.save_config({**previous, "morning_time": "08:00"})
+        profile = self.data / "additional-profile"
+        profile.mkdir()
+        candidate = {
+            **previous,
+            "subscriptions": [
+                *previous["subscriptions"],
+                {"id": SUB_C, "name": "Other tenant", "tenant_id": OTHER_TENANT},
+            ],
+            "tenant_profiles": {OTHER_TENANT: str(profile)},
+        }
+        with self.assertRaisesRegex(RuntimeError, "scope changed during discovery"):
+            self.collector.save_config(candidate, expected_config=previous)
+        self.assertEqual(self.collector.load_config(), changed)
+
+    def test_morning_schedule_retains_every_tenant_and_private_profile(self):
+        primary = self.data / "primary-profile"
+        extra = self.data / "additional-profile"
+        primary.mkdir()
+        extra.mkdir()
+        config = self.collector.save_config({
+            **self.config(),
+            "subscriptions": [
+                *self.config()["subscriptions"],
+                {"id": SUB_C, "name": "Other tenant", "tenant_id": OTHER_TENANT},
+            ],
+            "azure_config_dir": str(primary),
+            "tenant_profiles": {OTHER_TENANT: str(extra)},
+        })
+        response = subprocess.CompletedProcess([], 0, json.dumps(self.schedule(clock="06:30")), "")
+        with (
+            mock.patch("dashboard.collector._WINDOWS", True),
+            mock.patch.object(self.collector, "_run_command", return_value=response),
+        ):
+            self.collector.set_schedule(True, "06:30")
+        self.assertEqual(self.collector.load_config(), {**config, "morning_time": "06:30"})
+
+    def test_collecting_across_tenants_uses_each_profile_and_one_snapshot(self):
+        primary = self.data / "primary profile"
+        additional = self.data / "additional profile"
+        primary.mkdir()
+        additional.mkdir()
+        self.collector.save_config({
+            **self.config(second=True),
+            "subscriptions": [
+                *self.config(second=True)["subscriptions"],
+                {"id": SUB_C, "name": "Claude tenant", "tenant_id": OTHER_TENANT},
+            ],
+            "azure_config_dir": str(primary),
+            "tenant_profiles": {OTHER_TENANT: str(additional)},
+        })
+        observed = []
+
+        def successful(command, timeout, env=None):
+            tenant = command[command.index("-TenantId") + 1]
+            subscription = command[command.index("-SubscriptionId") + 1]
+            observed.append((subscription, tenant, env["AZURE_CONFIG_DIR"]))
+            self.outputs(command, tenant=tenant)
+            return subprocess.CompletedProcess(command, 0, '{"Rows": 1}', "")
+
+        with (
+            mock.patch.dict(os.environ, {"AZURE_CONFIG_DIR": "shared-not-selected"}),
+            mock.patch.object(self.collector, "_run_command", side_effect=successful),
+        ):
+            result = self.collector.run_scan("manual")
+        self.assertEqual(result["status"], "complete")
+        self.assertEqual(self.collector.state()["progress"]["total"], 3)
+        self.assertEqual(self.collector.state()["progress"]["completed"], 3)
+        self.assertEqual(observed, [
+            (SUB_A, TENANT, str(primary.resolve())),
+            (SUB_B, TENANT, str(primary.resolve())),
+            (SUB_C, OTHER_TENANT, str(additional.resolve())),
+        ])
+        self.assertEqual(self.store.ingested[0][3], [SUB_A, SUB_B, SUB_C])
+        self.assertEqual(self.store.ingested[0][2], [])
+        self.assertEqual(len(self.store.ingested), 1)
+
+    def test_multi_tenant_collection_publishes_one_filterable_real_snapshot(self):
+        primary = self.data / "primary"
+        other = self.data / "other"
+        primary.mkdir()
+        other.mkdir()
+        self.collector.save_config({
+            **self.config(),
+            "subscriptions": [
+                *self.config()["subscriptions"],
+                {"id": SUB_C, "name": "Other tenant", "tenant_id": OTHER_TENANT},
+            ],
+            "azure_config_dir": str(primary),
+            "tenant_profiles": {OTHER_TENANT: str(other)},
+        })
+        store = Store(self.data / "fixture.sqlite3")
+        collector = Collector(store, self.repo, self.data)
+
+        def report(command, timeout, env=None):
+            tenant = command[command.index("-TenantId") + 1]
+            expected = str(other if tenant == OTHER_TENANT else primary)
+            self.assertEqual(env["AZURE_CONFIG_DIR"], expected)
+            self.outputs(command, tenant=tenant)
+            return subprocess.CompletedProcess(command, 0, '{"Rows": 1}', "")
+
+        try:
+            with (
+                mock.patch.object(collector, "_powershell", return_value=str(Path(sys.executable).resolve())),
+                mock.patch.object(collector, "_run_command", side_effect=report),
+            ):
+                result = collector.run_scan()
+            self.assertEqual(result["status"], "complete")
+            self.assertEqual(result["subscription_count"], 2)
+            self.assertEqual(store.inventory({})["summary"]["subscriptions"], 2)
+            self.assertEqual(store.facets()["tenant"], [TENANT, OTHER_TENANT])
+            self.assertEqual(
+                {row["subscription_id"] for row in store.inventory({"tenant": OTHER_TENANT})["rows"]},
+                {SUB_C},
+            )
+        finally:
+            store.close()
+
+    def test_unavailable_additional_profile_is_partial_not_shared_profile_fallback(self):
+        primary = self.data / "primary"
+        primary.mkdir()
+        extra = self.data / "missing"
+        self.collector.save_config({
+            **self.config(),
+            "subscriptions": [
+                *self.config()["subscriptions"],
+                {"id": SUB_C, "name": "Another", "tenant_id": OTHER_TENANT},
+            ],
+            "azure_config_dir": str(primary),
+            "tenant_profiles": {OTHER_TENANT: str(extra)},
+        })
+
+        def healthy_first(command, timeout, env=None):
+            self.assertEqual(command[command.index("-SubscriptionId") + 1], SUB_A)
+            self.assertEqual(env["AZURE_CONFIG_DIR"], str(primary.resolve()))
+            self.outputs(command)
+            return subprocess.CompletedProcess(command, 0, '{"Rows": 1}', "")
+
+        with (
+            mock.patch.dict(os.environ, {"AZURE_CONFIG_DIR": "shared-not-selected"}),
+            mock.patch.object(self.collector, "_run_command", side_effect=healthy_first) as execute,
+        ):
+            result = self.collector.run_scan()
+        self.assertEqual(execute.call_count, 1)
+        self.assertEqual(result["status"], "partial")
+        self.assertEqual([path.name for path in self.store.ingested[0][1]], [f"{SUB_A}.csv"])
+        self.assertEqual(self.store.ingested[0][2][0]["subscription_id"], SUB_C)
+        self.assertIn("profile directory is unavailable", self.collector.state()["last_error"])
+        with _FileLock(self.collector.lock_path):
+            pass
+
+    def test_secondary_tenant_auth_error_guides_to_its_own_tenant(self):
+        extra = self.data / "other-tenant"
+        extra.mkdir()
+        self.collector.save_config({
+            **self.config(),
+            "subscriptions": [
+                *self.config()["subscriptions"],
+                {"id": SUB_C, "name": "Other", "tenant_id": OTHER_TENANT},
+            ],
+            "tenant_profiles": {OTHER_TENANT: str(extra)},
+        })
+
+        def fail_secondary(command, timeout, env=None):
+            if command[command.index("-SubscriptionId") + 1] == SUB_A:
+                return self.success(command, timeout, env)
+            return subprocess.CompletedProcess(
+                command, 1, "", "User 'fixture' does not exist in MSAL token cache. Run `az login`."
+            )
+
+        with mock.patch.object(self.collector, "_run_command", side_effect=fail_secondary):
+            self.assertEqual(self.collector.run_scan()["status"], "partial")
+        message = self.collector.state()["last_error"]
+        self.assertIn(f'az login --tenant "{OTHER_TENANT}"', message)
+        self.assertNotIn(f'az login --tenant "{TENANT}"', message)
 
     def test_cli_profile_rejects_relative_invalid_and_unignored_locations(self):
         self.configure()

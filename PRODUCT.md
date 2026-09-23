@@ -24,7 +24,7 @@ whether the dashboard is open. The browser connects only to localhost.
 
 ## Capabilities and Constraints
 
-- Filter subscriptions, regions, provider/model family, model, version,
+- Filter tenants, subscriptions, regions, provider/model family, model, version,
   deployment geography, billing/capacity type and quota availability.
 - Treat a model/version pair as one selectable catalog choice; allow broader
   model-name selection and family-to-version drill-down.
@@ -32,6 +32,8 @@ whether the dashboard is open. The browser connects only to localhost.
   and a system-aware dark/light appearance without adding frontend dependencies.
 - Preserve historical snapshots instead of replacing yesterday's data.
 - Reuse the existing PowerShell collectors; keep their standalone usage intact.
+- Scan multiple authorized tenants through separately selected local CLI
+  profiles without combining credentials or changing CLI defaults.
 - Keep the application lightweight, without a cloud service or database server.
 - Never equate catalog availability or remaining quota with guaranteed capacity.
 - Keep tenant configuration, databases, reports and logs out of the public repo.

@@ -66,8 +66,11 @@ class FakeCollector:
         self.schedule.update(enabled=enabled, time=time)
         return self.schedule_status()
 
-    def discover_subscriptions(self):
-        self.calls.append("discover_subscriptions")
+    def discover_subscriptions(self, azure_config_dir=None):
+        self.calls.append(
+            "discover_subscriptions" if azure_config_dir is None
+            else ("discover_subscriptions", azure_config_dir)
+        )
         if self.fail_discovery:
             raise RuntimeError("secret-diagnostic-must-not-appear")
         return [{"id": "sub-a", "name": "Development", "tenant_id": "tenant-a", "state": "Enabled"}]
@@ -181,9 +184,10 @@ class ServerTests(unittest.TestCase):
         result = json.loads(body)
         self.assertEqual(status, 200)
         self.assertEqual(set(result), {"configured", "config", "latest", "collection",
-                                      "schedule", "csrf_token"})
+                                      "scope_pending", "schedule", "csrf_token"})
         self.assertFalse(result["configured"])
         self.assertIsNone(result["latest"])
+        self.assertFalse(result["scope_pending"])
         self.assertEqual(result["csrf_token"], self.token)
         self.assertGreaterEqual(len(self.token), 32)
         self.assertEqual(headers["Referrer-Policy"], "no-referrer")
@@ -268,6 +272,69 @@ class ServerTests(unittest.TestCase):
         message = json.loads(self.request("GET", "/api/status")[2])["collection"]["last_error"]
         self.assertIn('az login --tenant "<affected-tenant-id>"', message)
         self.assertNotIn(tenant, message)
+
+    def test_other_tenant_auth_failure_guides_to_its_own_tenant(self):
+        primary = "10000000-0000-4000-8000-000000000001"
+        other = "10000000-0000-4000-8000-000000000002"
+        self.collector.config.update(
+            tenant_id=primary,
+            subscriptions=[
+                {"id": "sub-a", "name": "First"},
+                {"id": "sub-b", "name": "Second", "tenant_id": other},
+            ],
+            tenant_profiles={other: "D:\\fixture\\data\\azure-cli"},
+        )
+        self.server.invalidate_status()
+        failed = self.store.start_scan("fixture")
+        self.store.ingest_csvs(failed, [], failures=[{
+            "subscription_id": "sub-b",
+            "message": "User 'fixture' does not exist in MSAL token cache. Run `az login`.",
+        }])
+        message = json.loads(self.request("GET", "/api/status")[2])["collection"]["last_error"]
+        self.assertIn(f'az login --tenant "{other}"', message)
+        self.assertNotIn(f'az login --tenant "{primary}"', message)
+
+    def test_new_tenant_is_not_presented_as_part_of_an_old_complete_snapshot(self):
+        complete = self.ingest()
+        self.collector.config.update(
+            tenant_id="tenant-a",
+            subscriptions=[
+                {"id": "sub-a", "name": "First"},
+                {"id": "sub-b", "name": "Second", "tenant_id": "tenant-b"},
+            ],
+            tenant_profiles={"tenant-b": "D:\\fixture\\data\\azure-cli"},
+        )
+        self.server.invalidate_status()
+        result = json.loads(self.request("GET", "/api/status")[2])
+        self.assertEqual(result["latest"]["id"], complete)
+        self.assertTrue(result["scope_pending"])
+        newer = self.ingest(rows=[
+            {"Model": "first"},
+            {"Model": "claude-sample", "SubscriptionId": "sub-b", "TenantId": "tenant-b",
+             "Subscription": "Second", "Format": "Anthropic", "Kind": "AIServices"},
+        ])
+        result = json.loads(self.request("GET", "/api/status")[2])
+        self.assertEqual(result["latest"]["id"], newer)
+        self.assertFalse(result["scope_pending"])
+        self.collector.config["tenant_id"] = "tenant-c"
+        self.server.invalidate_status()
+        self.assertTrue(json.loads(self.request("GET", "/api/status")[2])["scope_pending"])
+
+    def test_profile_scoped_discovery_requires_same_origin_token_and_explicit_path(self):
+        profile = "D:\\fixture\\data\\azure-cli"
+        for body in ({}, {"azure_config_dir": None}, {"command": "whoami"},
+                     {"azure_config_dir": profile, "command": "whoami"}):
+            with self.subTest(body=body):
+                self.assert_json_error(self.post("/api/subscriptions", body), 400)
+        self.assert_json_error(self.request(
+            "POST", "/api/subscriptions", b'{"azure_config_dir":"D:\\\\fixture"}',
+            {"Content-Type": "application/json"},
+        ), 403)
+        self.assertNotIn(("discover_subscriptions", profile), self.collector.calls)
+        result = json.loads(self.post("/api/subscriptions", {"azure_config_dir": profile})[2])
+        self.assertEqual(result["subscriptions"][0]["id"], "sub-a")
+        self.assertIn(("discover_subscriptions", profile), self.collector.calls)
+        self.assertEqual(self.request("GET", "/api/subscriptions")[0], 200)
 
     def test_correct_localhost_host_and_origin_are_allowed(self):
         status = self.request(

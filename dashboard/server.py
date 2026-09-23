@@ -15,7 +15,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
-from .collector import summarize_collection_errors
+from .collector import auth_failure_tenant, summarize_collection_errors
 from .store import CATEGORICAL_FILTERS
 
 
@@ -52,7 +52,7 @@ _GET_ROUTES = {
     "/api/compare", "/api/history", "/api/export.csv", "/api/subscriptions", "/api/groups",
     "/api/quota", "/api/quota.csv",
 }
-_POST_ROUTES = {"/api/config", "/api/scan", "/api/schedule"}
+_POST_ROUTES = {"/api/config", "/api/scan", "/api/schedule", "/api/subscriptions"}
 
 
 class _HTTPError(Exception):
@@ -140,17 +140,23 @@ class _LocalServer(ThreadingHTTPServer):
                 + ("The last complete snapshot remains selected." if latest else
                    "There is no complete snapshot yet.")
             )
-            configured_subscriptions = {item["id"] for item in cached["config"]["subscriptions"]}
-            same_scope = all(
-                item["subscription_id"] in configured_subscriptions for item in attempt["errors"]
-            )
             collection["last_error"] = summarize_collection_errors(
                 [item["message"] for item in attempt["errors"]],
-                cached["config"].get("tenant_id", "") if same_scope else "",
+                auth_failure_tenant(cached["config"], attempt["errors"]),
             ) or collection.get("last_error", "")
+        configured_scopes = {
+            (item["id"], item.get("tenant_id", cached["config"]["tenant_id"]))
+            for item in cached["config"].get("subscriptions", [])
+        }
+        observed_scopes = (
+            {(item["subscription_id"], item["tenant_id"])
+             for item in self.store.coverage(latest["id"])["rows"]}
+            if latest and configured_scopes else set()
+        )
         return {
             "configured": bool(cached["config"].get("tenant_id") and
                                cached["config"].get("subscriptions")),
+            "scope_pending": bool(latest and configured_scopes != observed_scopes),
             "config": cached["config"], "latest": latest, "collection": collection,
             "schedule": cached["schedule"], "csrf_token": self.csrf_token,
         }
@@ -340,6 +346,10 @@ class _Handler(BaseHTTPRequestHandler):
         collector = self.server.collector
         if path == "/api/config":
             result = {"config": collector.save_config(body)}
+        elif path == "/api/subscriptions":
+            if set(body) != {"azure_config_dir"} or not isinstance(body["azure_config_dir"], str):
+                raise _HTTPError(400, "Specify one private Azure CLI profile directory.")
+            result = {"subscriptions": collector.discover_subscriptions(body["azure_config_dir"])}
         elif path == "/api/scan":
             if body:
                 raise _HTTPError(400, "Scan accepts an empty JSON object only.")
