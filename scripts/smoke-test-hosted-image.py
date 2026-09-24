@@ -116,6 +116,11 @@ def check_first_container(box: Container, commit: str | None, home: Path) -> dic
     status, headers, body = box.request("GET", "/", principal(TENANT))
     expect(status == 200 and b"<title>Foundry inventory" in body
            and headers.get("Content-Type", "").startswith("text/html"), "a signed-in tenant user gets the dashboard")
+    navigation = {"Sec-Fetch-Site": "cross-site", "Sec-Fetch-Mode": "navigate", "Sec-Fetch-Dest": "document"}
+    status, _, _ = box.request("GET", "/", {**principal(TENANT), **navigation})
+    expect(status == 200, "the page opens after the cross-site redirect back from sign-in")
+    status, _, _ = box.request("GET", "/api/status", {**principal(TENANT), **navigation})
+    expect(status == 403, "cross-site requests for data are refused")
     result = box.json("/api/status")
     expect(result.get("read_only") is True and result["hosted"]["timezone"] == "America/Chicago",
            "status reports read-only hosted details and the image time zone")

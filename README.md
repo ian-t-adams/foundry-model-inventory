@@ -386,7 +386,9 @@ page behind sign-in. Every push to `main` then runs
 smoke test, then a build pushed as `foundry-inventory:<commit>`. The web app is
 pointed at exactly that tag, and the workflow checks that an unauthenticated
 HTTPS request is redirected to Microsoft Entra sign-in. Deployments run one at a
-time. Pull requests run the tests and the image smoke test without secrets.
+time, and a run whose commit is no longer the tip of `main` leaves the web app
+unchanged, so an older run that finishes late cannot replace a newer image. Pull
+requests run the tests and the image smoke test without secrets.
 
 ### Redeploy, change and tear down
 
@@ -417,6 +419,13 @@ az ad app delete --id "<sign-in-app-client-id>"
 Deleting the resource group removes the registry, plan, web app, deploy identity
 and the role assignments inside it. Disable the workflow as well, or the next
 push to `main` fails at Azure sign-in.
+
+Role assignment names come from the resource IDs, not the identities. If the web
+app, the deploy identity or the resource group was deleted before its role
+assignments, delete the leftover assignments (the portal lists them as
+**Identity not found**) on the collected subscriptions, the registry and the web
+app before you run the script again. Otherwise Azure rejects the new identity
+with `RoleAssignmentUpdateNotPermitted`.
 
 ### Data handling
 

@@ -56,6 +56,7 @@ SIGN_IN_FAILED = (
     "Hosted collection could not sign in with the web app's system-assigned managed identity"
 )
 _MUTATIONS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+_PAGES = frozenset({"/", "/index.html"})
 _HOST = re.compile(r"[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?(?::[0-9]{1,5})?\Z")
 _COMMIT = re.compile(r"[0-9a-f]{7,40}\Z")
 _STANDARD_B64 = re.compile(r"[A-Za-z0-9+/]+={0,2}\Z")
@@ -581,10 +582,21 @@ class _HostedHandler(_Handler):
             if origin not in {f"{scheme}://{host.strip().lower()}", f"{scheme}://{_normal_host(host)}"}:
                 raise _HTTPError(403, "Cross-origin requests are not allowed.")
         site = self._one_header("Sec-Fetch-Site")
-        if site and site not in {"same-origin", "none"}:
+        if site and site not in {"same-origin", "none"} and not self._page_navigation():
             raise _HTTPError(403, "Cross-site requests are not allowed.")
         if mutation:
             raise _HTTPError(403, READ_ONLY)
+
+    def _page_navigation(self) -> bool:
+        """Top-level GET navigations may open the dashboard page from another site.
+
+        Signing in returns through login.microsoftonline.com, so the page load after it
+        is cross-site. Framing stays blocked, and the API and assets stay same-origin.
+        """
+        return (self.command == "GET"
+                and self._one_header("Sec-Fetch-Mode") == "navigate"
+                and self._one_header("Sec-Fetch-Dest") == "document"
+                and urlsplit(self.path).path in _PAGES)
 
     def _dispatch(self):
         # The platform's container ping arrives without identity; it learns nothing.

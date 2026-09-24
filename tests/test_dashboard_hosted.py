@@ -708,6 +708,31 @@ class HostedServerTests(Workspace):
         forwarded = {**headers, "Origin": f"https://{HOST}", "X-Forwarded-Proto": "https"}
         self.assertEqual(self.request("GET", "/api/status", forwarded)[0], 200)
 
+    def test_cross_site_navigation_opens_only_the_page(self):
+        # After sign-in, the redirect back from Microsoft Entra reaches the page as cross-site.
+        navigation = {"Sec-Fetch-Site": "cross-site", "Sec-Fetch-Mode": "navigate",
+                      "Sec-Fetch-Dest": "document", "Sec-Fetch-User": "?1"}
+        same_site = {**navigation, "Sec-Fetch-Site": "same-site"}
+        for path, headers in (("/", navigation), ("/index.html", navigation),
+                              ("/?view=quota", navigation), ("/", same_site)):
+            with self.subTest(path=path, site=headers["Sec-Fetch-Site"]):
+                status, response_headers, body = self.request("GET", path, {**identity(), **headers})
+                self.assertEqual(status, 200, body)
+                self.assertIn(b"Hosted fixture", body)
+                self.assertEqual(response_headers["X-Frame-Options"], "DENY")
+        refused = (
+            ("/api/status", navigation), ("/app.js", navigation), ("/api/status", same_site),
+            ("/", {**navigation, "Sec-Fetch-Dest": "iframe"}),
+            ("/", {**navigation, "Sec-Fetch-Dest": "embed"}),
+            ("/", {**navigation, "Sec-Fetch-Mode": "no-cors"}),
+            ("/", {**navigation, "Sec-Fetch-Mode": "cors", "Sec-Fetch-Dest": "empty"}),
+        )
+        for path, headers in refused:
+            with self.subTest(path=path, headers=headers):
+                self.assertIn("Cross-site", self.error(self.request("GET", path, {**identity(), **headers}), 403))
+        self.assertEqual(self.request("HEAD", "/", {**identity(), **navigation})[0], 403)
+        self.assertIn("Sign in", self.error(self.request("GET", "/", {"Host": HOST, **navigation}), 401))
+
 
 class CommandLineTests(unittest.TestCase):
     def test_hosted_command_defaults_and_port_validation(self):

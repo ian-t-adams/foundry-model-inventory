@@ -76,7 +76,9 @@ function Invoke-AzJson {
     param([Parameter(Mandatory)][string[]]$Arguments, [switch]$AllowFailure)
     $text = Invoke-Az -Arguments ($Arguments + @('--output', 'json')) -AllowFailure:$AllowFailure
     if ($null -eq $text -or $text -eq '') { return $null }
-    return $text | ConvertFrom-Json
+    # Windows PowerShell 5.1 emits a JSON array as one object; returning the variable unrolls it.
+    $value = $text | ConvertFrom-Json
+    return $value
 }
 
 function New-ScratchFile([string]$Name, $Value) {

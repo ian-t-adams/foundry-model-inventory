@@ -109,7 +109,19 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
       - name: Point the web app at this commit
+        id: point
         run: |
+          # Deploy only the tip of main, so an older run that finishes late cannot replace a newer image.
+          if ! tip="$(git ls-remote --exit-code origin refs/heads/main)"; then
+            echo "::error::Could not read the tip of main, so the web app was not changed."
+            exit 1
+          fi
+          tip="${tip%%[[:space:]]*}"
+          if [ "$tip" != "$GITHUB_SHA" ]; then
+            echo "::notice::main has moved on to ${tip}; its run deploys that commit, so this run leaves the web app unchanged."
+            echo "deployed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           image="${AZURE_ACR_NAME}.azurecr.io/foundry-inventory:${GITHUB_SHA}"
           config="https://management.azure.com/subscriptions/${AZURE_SUBSCRIPTION_ID}/resourceGroups/${AZURE_RESOURCE_GROUP}/providers/Microsoft.Web/sites/${AZURE_WEBAPP_NAME}/config/web?api-version=2024-04-01"
           # Patch only the image so every other site and app setting stays as deployed.
@@ -126,8 +138,10 @@ jobs:
             echo "::error::Persistent /home storage is not enabled; the database backup would not survive restarts."
             exit 1
           fi
+          echo "deployed=true" >> "$GITHUB_OUTPUT"
           echo "The web app now runs foundry-inventory:${GITHUB_SHA}."
       - name: Verify the HTTPS sign-in redirect
+        if: steps.point.outputs.deployed == 'true'
         run: |
           host="$(az webapp show --resource-group "$AZURE_RESOURCE_GROUP" --name "$AZURE_WEBAPP_NAME" \
             --query defaultHostName --output tsv --only-show-errors)"
