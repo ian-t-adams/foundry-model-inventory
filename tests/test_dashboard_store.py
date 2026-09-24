@@ -9,6 +9,7 @@ import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
+from datetime import datetime, timezone
 from pathlib import Path
 
 from dashboard.store import MAX_FILTER_FIELD, MAX_FILTER_ITEMS, ROW_FIELDS, Store
@@ -100,6 +101,28 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(self.store.coverage(), {"rows": [], "snapshot": None})
         self.assertEqual(self.store.history({}), {"points": []})
         self.assertTrue(all(value == [] for value in self.store.facets().values()))
+
+    def test_deleting_old_snapshots_keeps_the_latest_complete_and_running_scans(self):
+        old = self.ingest([report_row()], started_at="2026-01-01T12:00:00+00:00")
+        failed = self.store.start_scan("test", started_at="2026-02-01T12:00:00+00:00")
+        self.store.fail_scan(failed, "Sign-in failed.")
+        running = self.store.start_scan("test", started_at="2026-01-15T12:00:00+00:00")
+        recent = self.ingest([report_row(Model="gpt-recent")], started_at="2026-06-01T12:00:00+00:00")
+        cutoff = datetime(2026, 5, 1, tzinfo=timezone.utc)
+        self.assertEqual(self.store.delete_snapshots_before(cutoff), 2)
+        self.assertEqual([scan["id"] for scan in self.store.scans()], [recent, running])
+        with closing(sqlite3.connect(self.store.db_path)) as db:
+            for table in ("inventory", "coverage"):
+                with self.subTest(table=table):
+                    scans = {row[0] for row in db.execute(f"SELECT DISTINCT scan_id FROM {table}")}
+                    self.assertEqual(scans, {recent})
+        self.assertNotIn(old, [scan["id"] for scan in self.store.scans()])
+        self.assertEqual(self.store.delete_snapshots_before(cutoff), 0)
+        self.assertEqual(self.store.delete_snapshots_before(datetime(2027, 1, 1, tzinfo=timezone.utc)), 0,
+                         "the latest complete snapshot is kept even when it is older than the cutoff")
+        self.assertEqual(self.store.inventory({})["snapshot"]["id"], recent)
+        with self.assertRaises(ValueError):
+            self.store.delete_snapshots_before(datetime(2026, 5, 1))
 
     def test_initialization_is_idempotent_wal_and_persistent(self):
         scan_id = self.ingest([report_row()])

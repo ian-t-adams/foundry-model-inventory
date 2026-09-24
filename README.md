@@ -374,8 +374,9 @@ subscription, and refuses the default `~/.azure` profile.
 
 The scope comes from `data\config.json`: its subscriptions in the hosting
 subscription's tenant, and its morning time. Use `-CollectSubscriptionId` to
-choose subscriptions explicitly, and `-MorningTime`, `-TimeZone`, `-Location`
-or `-ResourceGroupName` to override defaults. `-ValidateOnly` registers the
+choose subscriptions explicitly, and `-MorningTime`, `-TimeZone`,
+`-SnapshotRetentionDays`, `-Location` or `-ResourceGroupName` to override
+defaults. `-ValidateOnly` registers the
 `Microsoft.Web` provider when needed, validates the template and prints a
 what-if summary without other changes. A full run creates or updates the app
 registration and its service principal, deploys the template, sets the redirect
@@ -448,9 +449,13 @@ with `RoleAssignmentUpdateNotPermitted`.
   the repository or image. The image contains code only.
 - Managed-identity sign-in state lives only on the container disk, never in
   `/home`. The diagnostics of the latest seven collections are kept there.
-- Snapshots are retained, so the database grows with each daily collection;
-  B1 includes 10 GB of `/home` storage. **Collection & history** shows the
-  latest persistent copy.
+- After each collection the service deletes snapshots older than 90 days
+  (`-SnapshotRetentionDays`, 7 to 3650), always keeping the latest complete
+  one, so the database and its `/home` copy stay bounded. A daily snapshot of
+  three subscriptions is about 21 MB, so 90 days is about 2 GB. B1 includes
+  10 GB of `/home` storage, and replacing the copy briefly needs twice the
+  database size. **Collection & history** shows the latest persistent copy. The
+  local dashboard keeps every snapshot.
 - Container logs are kept in `/home/LogFiles` for three days (35 MB). There is no
   Application Insights resource, and Azure CLI and PowerShell telemetry are off.
 - The server re-checks the App Service identity headers and the tenant on every

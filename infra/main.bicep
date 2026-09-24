@@ -32,6 +32,11 @@ param githubBranch string = 'main'
 @description('IANA time zone for the daily collection time.')
 param timeZone string = 'America/Chicago'
 
+@description('Days of snapshots the hosted database keeps; the latest complete snapshot is always kept. A daily snapshot of three subscriptions is about 21 MB, and /home briefly needs twice the database size while its copy is replaced.')
+@minValue(7)
+@maxValue(3650)
+param snapshotRetentionDays int = 90
+
 @description('Tags applied to the resource group and resources.')
 param tags object = {
   workload: 'foundry-model-inventory'
@@ -57,6 +62,7 @@ module app 'modules/app.bicep' = {
     githubSubjectPrefix: githubSubjectPrefix
     githubBranch: githubBranch
     timeZone: timeZone
+    snapshotRetentionDays: snapshotRetentionDays
     tags: tags
   }
 }

@@ -34,6 +34,7 @@ param(
     [string]$Location = 'centralus',
     [ValidatePattern('^[-\w._()]{1,90}$')][string]$ResourceGroupName = 'rg-foundry-inventory',
     [string]$TimeZone = 'America/Chicago',
+    [ValidateRange(7, 3650)][int]$SnapshotRetentionDays = 90,
     [ValidatePattern('^[A-Za-z0-9-]+/[A-Za-z0-9._-]+$')][string]$GitHubRepository,
     [ValidatePattern('^repo:[A-Za-z0-9-]+(@[0-9]+)?/[A-Za-z0-9._-]+(@[0-9]+)?$')][string]$GitHubSubjectPrefix,
     [string]$GitHubBranch = 'main',
@@ -173,7 +174,7 @@ try {
     if (-not $MorningTime) { $MorningTime = if ($configTime -match '^([01][0-9]|2[0-3]):[0-5][0-9]$') { $configTime } else { '07:00' } }
     $scopeJson = [ordered]@{ tenant_id = $tenantId; subscriptions = @($subscriptions); morning_time = $MorningTime } |
         ConvertTo-Json -Depth 5 -Compress
-    Write-Host "    Collection scope: $($subscriptions.Count) subscription(s), daily at $MorningTime ($TimeZone)"
+    Write-Host "    Collection scope: $($subscriptions.Count) subscription(s), daily at $MorningTime ($TimeZone), keeping $SnapshotRetentionDays days of snapshots"
 
     if (-not $GitHubRepository) {
         $origin = (& git -C $repoRoot remote get-url origin 2>$null)
@@ -233,6 +234,7 @@ try {
             githubSubjectPrefix = @{ value = $GitHubSubjectPrefix }
             githubBranch = @{ value = $GitHubBranch }
             timeZone = @{ value = $TimeZone }
+            snapshotRetentionDays = @{ value = $SnapshotRetentionDays }
         }
     }
     $parameterFile = New-ScratchFile 'deploy-hosted.parameters' $parameters

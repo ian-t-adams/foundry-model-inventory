@@ -40,6 +40,8 @@ PLATFORM_PING = "/robots933456.txt"
 DEFAULT_BACKUP_DIR = "/home/foundry-inventory"
 BACKUP_NAME = "inventory.sqlite3"
 KEEP_RUNS = 7
+RETENTION_DAYS = 90
+RETENTION_RANGE = (7, 3650)
 MAX_PRINCIPAL = 32 * 1024
 MAX_SCOPE = 64 * 1024
 TENANT_CLAIMS = frozenset({"http://schemas.microsoft.com/identity/claims/tenantid", "tid"})
@@ -88,6 +90,7 @@ class HostedSettings:
     zone: tzinfo
     backup_dir: Path
     commit: str
+    retention_days: int = RETENTION_DAYS
 
 
 def parse_scope(raw: str | None) -> dict:
@@ -166,6 +169,17 @@ def build_commit(value: str | None) -> str:
     return value if _COMMIT.fullmatch(value) else "unknown"
 
 
+def parse_retention(value: str | None) -> int:
+    """Days of snapshots the hosted database keeps; the latest complete one is always kept."""
+    text = (value or "").strip()
+    if not text:
+        return RETENTION_DAYS
+    low, high = RETENTION_RANGE
+    if not re.fullmatch(r"[0-9]{1,5}", text) or not low <= int(text) <= high:
+        raise ValueError(f"FOUNDRY_INVENTORY_RETENTION_DAYS must be a whole number of days from {low} to {high}.")
+    return int(text)
+
+
 def load_settings(environ: Mapping[str, str]) -> HostedSettings:
     """Read hosted settings from App Service application settings; fail closed."""
     tenant = _guid(environ.get("FOUNDRY_INVENTORY_AUTH_TENANT_ID"), "FOUNDRY_INVENTORY_AUTH_TENANT_ID")
@@ -182,6 +196,7 @@ def load_settings(environ: Mapping[str, str]) -> HostedSettings:
         zone=zone,
         backup_dir=Path(backup),
         commit=build_commit(environ.get("FOUNDRY_INVENTORY_COMMIT")),
+        retention_days=parse_retention(environ.get("FOUNDRY_INVENTORY_RETENTION_DAYS")),
     )
 
 
@@ -551,13 +566,30 @@ def latest_complete(store) -> str | None:
         store.close()
 
 
-def collect_once(collector: HostedCollector, backup: DatabaseBackup | None) -> None:
+def apply_retention(store, days: int, now: Callable[[], datetime] = _utcnow) -> int:
+    """Keep the hosted database, and so its /home copy, within a bounded size."""
+    try:
+        removed = store.delete_snapshots_before(now() - timedelta(days=days))
+    except Exception as exc:
+        # Clean-up must never stop the backup that follows it.
+        _LOG.error("Snapshots older than %d days could not be removed: %s", days, _detail(exc))
+        return 0
+    finally:
+        store.close()
+    if removed:
+        _LOG.info("Removed %d snapshot(s) older than %d days.", removed, days)
+    return removed
+
+
+def collect_once(collector: HostedCollector, backup: DatabaseBackup | None,
+                 retention_days: int = RETENTION_DAYS) -> None:
     try:
         result = collector.run_scan(source="scheduled")
         _LOG.info("Hosted collection finished with status %s.", result.get("status"))
     except Exception as exc:
         _LOG.error("Hosted collection did not complete: %s", _detail(exc))
     finally:
+        apply_retention(collector.store, retention_days)
         if backup is not None:
             backup.save()
         prune_runs(collector.data_dir / "runs")
@@ -670,6 +702,7 @@ class _HostedServer(_LocalServer):
                 for key in ("status", "source", "started_at", "completed_at", "error_count")
             } if attempt else None,
             "database_bytes": database_bytes,
+            "retention_days": self.settings.retention_days,
             "backup": self.backup.state() if self.backup else None,
             "user": "",
         }
@@ -703,7 +736,7 @@ def run(repo_root: Path, data_dir: Path, port: int = HOSTED_PORT,
         config = apply_scope(collector, settings.scope)
         store.close()
         scheduler = DailyScheduler(
-            lambda: collect_once(collector, backup), lambda: latest_complete(store),
+            lambda: collect_once(collector, backup, settings.retention_days), lambda: latest_complete(store),
             config["morning_time"], settings.zone,
         )
         server = create_hosted_server(
@@ -719,8 +752,9 @@ def run(repo_root: Path, data_dir: Path, port: int = HOSTED_PORT,
         threading.Thread(target=scheduler.run, name="foundry-hosted-scheduler", daemon=True).start()
         _LOG.info(
             "Hosted Foundry inventory %s is listening on 0.0.0.0:%d; it collects %d "
-            "subscription(s) daily at %s (%s).", settings.commit, server.server_address[1],
-            len(config["subscriptions"]), config["morning_time"], settings.timezone_name,
+            "subscription(s) daily at %s (%s) and keeps %d days of snapshots.", settings.commit,
+            server.server_address[1], len(config["subscriptions"]), config["morning_time"],
+            settings.timezone_name, settings.retention_days,
         )
         server.serve_forever(poll_interval=0.5)
         return 0
