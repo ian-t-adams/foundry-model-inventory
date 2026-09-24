@@ -79,7 +79,8 @@ control that would change collection instead of disabling it in place:
   the collected subscriptions. Morning collection shows the daily time and time
   zone, the next run, the latest attempt as a status label, the state of the
   persistent copy and the deployed commit, followed by one sentence explaining
-  that the service collects on its own and is changed through its deployment.
+  that the service collects on its own, how many days of snapshots it keeps,
+  and that it is changed through its deployment.
 - Empty states, notices and the stale-data warning point to the hosted schedule
   and Collection & history, never to Collect now. A failed attempt shows one
   concise diagnostic, not a traceback.

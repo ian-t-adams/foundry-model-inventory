@@ -21,8 +21,8 @@ from uuid import uuid4
 from dashboard import hosted
 from dashboard.__main__ import main, parser
 from dashboard.hosted import (
-    DailyScheduler, DatabaseBackup, HostedCollector, apply_scope, authenticate,
-    create_hosted_server, load_settings, prune_runs, scheduled_slots,
+    DailyScheduler, DatabaseBackup, HostedCollector, apply_retention, apply_scope, authenticate,
+    collect_once, create_hosted_server, load_settings, prune_runs, scheduled_slots,
 )
 from dashboard.server import _HTTPError
 from dashboard.store import Store
@@ -90,6 +90,22 @@ def environment(**changes):
     }
     value.update(changes)
     return {key: item for key, item in value.items() if item is not None}
+
+
+def snapshot(store, path, started_at=None):
+    """Record one complete snapshot with a single inventory row."""
+    scan = store.start_scan("scheduled", started_at=started_at)
+    with path.open("w", encoding="utf-8-sig", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=FIELDS)
+        writer.writeheader()
+        row = dict.fromkeys(FIELDS, "")
+        row.update(Subscription="Fixture", SubscriptionId=SUB_A, TenantId=TENANT, Region="eastus",
+                   Model="example-model", Version="1", SKU="GlobalStandard", Catalog="Listed",
+                   Limit="10", Allocated="1", Remaining="9", Unit="1K TPM", QuotaStatus="Reported",
+                   QuotaName="pool", Format="OpenAI", Kind="OpenAI", Lifecycle="GenerallyAvailable")
+        writer.writerow(row)
+    store.ingest_csvs(scan, [path])
+    return scan
 
 
 class Workspace(unittest.TestCase):
@@ -175,6 +191,7 @@ class SettingsTests(Workspace):
         self.assertEqual((settings.timezone_name, settings.zone), ("UTC", timezone.utc))
         self.assertEqual(settings.commit, COMMIT)
         self.assertEqual(settings.backup_dir, self.workspace / "home")
+        self.assertEqual(settings.retention_days, 90)
 
     def test_commit_and_timezone_fall_back_or_fail_closed(self):
         self.assertEqual(self.settings(FOUNDRY_INVENTORY_COMMIT="main; rm -rf").commit, "unknown")
@@ -182,6 +199,8 @@ class SettingsTests(Workspace):
         self.assertEqual(self.settings(TZ=None).timezone_name, "UTC")
         with self.assertRaisesRegex(ValueError, "TZ must be an IANA time zone"):
             self.settings(TZ="Not/AZone")
+        self.assertEqual(self.settings(FOUNDRY_INVENTORY_RETENTION_DAYS=" 30 ").retention_days, 30)
+        self.assertEqual(self.settings(FOUNDRY_INVENTORY_RETENTION_DAYS="").retention_days, 90)
 
     def test_invalid_settings_are_rejected(self):
         cases = {
@@ -198,6 +217,12 @@ class SettingsTests(Workspace):
             "no host": {"WEBSITE_HOSTNAME": None},
             "bad host": {"FOUNDRY_INVENTORY_ALLOWED_HOSTS": "evil.example/test"},
             "relative backup": {"FOUNDRY_INVENTORY_BACKUP_DIR": "home/backup"},
+            "retention too short": {"FOUNDRY_INVENTORY_RETENTION_DAYS": "6"},
+            "retention too long": {"FOUNDRY_INVENTORY_RETENTION_DAYS": "3651"},
+            "retention negative": {"FOUNDRY_INVENTORY_RETENTION_DAYS": "-30"},
+            "retention fraction": {"FOUNDRY_INVENTORY_RETENTION_DAYS": "30.5"},
+            "retention words": {"FOUNDRY_INVENTORY_RETENTION_DAYS": "ninety"},
+            "retention non-ASCII digits": {"FOUNDRY_INVENTORY_RETENTION_DAYS": "\u0663\u0660"},
         }
         for label, changes in cases.items():
             with self.subTest(label), self.assertRaises(ValueError):
@@ -432,6 +457,45 @@ class BackupTests(Workspace):
         prune_runs(self.data / "missing")
 
 
+class RetentionTests(Workspace):
+    def test_snapshots_older_than_the_window_are_removed(self):
+        store = Store(self.data / "inventory.sqlite3")
+        self.addCleanup(store.close)
+        now = datetime(2026, 9, 24, 12, tzinfo=timezone.utc)
+        snapshot(store, self.workspace / "old.csv", (now - timedelta(days=91)).isoformat())
+        failed = store.start_scan("scheduled", started_at=(now - timedelta(days=95)).isoformat())
+        store.fail_scan(failed, "Sign-in failed.")
+        kept = snapshot(store, self.workspace / "kept.csv", (now - timedelta(days=89)).isoformat())
+        with self.assertLogs("dashboard.hosted", level="INFO") as logs:
+            self.assertEqual(apply_retention(store, 90, now=lambda: now), 2)
+        self.assertIn("Removed 2 snapshot(s) older than 90 days.", logs.output[0])
+        self.assertEqual([scan["id"] for scan in store.scans()], [kept])
+        self.assertEqual(apply_retention(store, 90, now=lambda: now + timedelta(days=400)), 0)
+        self.assertEqual([scan["id"] for scan in store.scans()], [kept],
+                         "the latest complete snapshot is kept even when it is older")
+
+    def test_failures_are_logged_not_raised(self):
+        for error in (sqlite3.OperationalError("database is locked"), RuntimeError("unexpected")):
+            with self.subTest(error=type(error).__name__):
+                store = mock.Mock()
+                store.delete_snapshots_before.side_effect = error
+                with self.assertLogs("dashboard.hosted", level="ERROR"):
+                    self.assertEqual(apply_retention(store, 90), 0)
+                store.close.assert_called_once_with()
+
+    def test_each_collection_applies_retention_before_the_backup(self):
+        calls = []
+        collector = mock.Mock(store="store", data_dir=self.data)
+        collector.run_scan.side_effect = RuntimeError("Sign-in failed.")
+        backup = mock.Mock()
+        backup.save.side_effect = lambda: calls.append("backup")
+        with (mock.patch("dashboard.hosted.apply_retention",
+                         side_effect=lambda store, days: calls.append(("retention", store, days))),
+              self.assertLogs("dashboard.hosted", level="ERROR")):
+            collect_once(collector, backup, 30)
+        self.assertEqual(calls, [("retention", "store", 30), "backup"])
+
+
 class FakeStore:
     def __init__(self):
         self.started, self.failed, self.ingested = [], [], []
@@ -619,18 +683,7 @@ class HostedServerTests(Workspace):
         return payload["error"]
 
     def ingest(self):
-        scan = self.store.start_scan("scheduled")
-        path = self.workspace / "fixture.csv"
-        with path.open("w", encoding="utf-8-sig", newline="") as handle:
-            writer = csv.DictWriter(handle, fieldnames=FIELDS)
-            writer.writeheader()
-            row = dict.fromkeys(FIELDS, "")
-            row.update(Subscription="Fixture", SubscriptionId=SUB_A, TenantId=TENANT, Region="eastus",
-                       Model="example-model", Version="1", SKU="GlobalStandard", Catalog="Listed",
-                       Limit="10", Allocated="1", Remaining="9", Unit="1K TPM", QuotaStatus="Reported",
-                       QuotaName="pool", Format="OpenAI", Kind="OpenAI", Lifecycle="GenerallyAvailable")
-            writer.writerow(row)
-        self.store.ingest_csvs(scan, [path])
+        snapshot(self.store, self.workspace / "fixture.csv")
 
     def test_binds_all_interfaces_by_default(self):
         self.assertEqual(inspect.signature(create_hosted_server).parameters["bind_address"].default, "0.0.0.0")
@@ -683,6 +736,7 @@ class HostedServerTests(Workspace):
         self.assertEqual(hosted_status["user"], "ada@example.test")
         self.assertEqual(hosted_status["last_attempt"]["status"], "complete")
         self.assertGreater(hosted_status["database_bytes"], 0)
+        self.assertEqual(hosted_status["retention_days"], 90)
         self.assertTrue(hosted_status["backup"]["enabled"])
         self.assertEqual(result["schedule"]["time"], "07:00")
         self.assertIn("every day at 07:00 (UTC)", result["schedule"]["note"])

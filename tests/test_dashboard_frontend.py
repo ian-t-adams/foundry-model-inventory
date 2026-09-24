@@ -214,6 +214,7 @@ const status = {
   hosted: {
     commit: "0123456789abcdef0123456789abcdef01234567", timezone: "America/Chicago",
     collection_time: "07:00", next_run: "2026-09-24T07:00:00-05:00", user: "ada@example.test",
+    retention_days: 90,
     last_attempt: { status: "failed", started_at: "2026-09-23T12:00:00+00:00", completed_at: "2026-09-23T12:01:00+00:00" },
     backup: { saved_at: "2026-09-23T12:02:00+00:00", error: null },
   },
@@ -222,7 +223,14 @@ const view = context.hostedView(status);
 assert.equal(view.label, "Hosted · read-only");
 assert.equal(view.schedule, "Daily at 07:00 · America/Chicago");
 assert.match(view.explanation, /every morning at 07:00 \(America\/Chicago\)/);
+assert.match(view.explanation, /identity and keeps the last 90 days of snapshots\. Collection/);
 assert.match(view.explanation, /not in the browser/);
+assert.match(context.hostedView({ ...status, hosted: { ...status.hosted, retention_days: 1 } }).explanation,
+  /keeps the last 1 day of snapshots\./);
+for (const retention_days of ["90", 0, 2.5, null]) {
+  assert.match(context.hostedView({ ...status, hosted: { ...status.hosted, retention_days } }).explanation,
+    /identity\. Collection, scope/);
+}
 assert.equal(view.commit, "0123456");
 assert.equal(view.commitTitle, status.hosted.commit);
 assert.equal(view.scope, "2 subscriptions in 1 tenant, collected by the hosted service.");

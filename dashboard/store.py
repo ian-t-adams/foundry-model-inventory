@@ -805,6 +805,24 @@ class Store:
                 "SELECT * FROM scans ORDER BY started_at DESC,id DESC"
             )]
 
+    def delete_snapshots_before(self, cutoff: datetime) -> int:
+        """Delete finished scans that started before cutoff, except the latest complete one."""
+        if not isinstance(cutoff, datetime) or cutoff.tzinfo is None:
+            raise ValueError("The retention cutoff must be a timezone-aware datetime.")
+        with self._transaction(write=True) as db:
+            latest = self._snapshot(db)
+            expired = []
+            for row in db.execute("SELECT id,started_at FROM scans WHERE status!='running'"):
+                started = datetime.fromisoformat(row["started_at"].replace("Z", "+00:00"))
+                if started.tzinfo is None:
+                    started = started.replace(tzinfo=timezone.utc)
+                if started < cutoff and (latest is None or row["id"] != latest["id"]):
+                    expired.append((row["id"],))
+            for table in ("inventory", "coverage"):
+                db.executemany(f"DELETE FROM {table} WHERE scan_id=?", expired)
+            db.executemany("DELETE FROM scans WHERE id=?", expired)
+            return len(expired)
+
     @staticmethod
     def _filters(filters: dict | None, *, grouped: bool = False) -> dict:
         if filters is None:

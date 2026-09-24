@@ -1005,11 +1005,13 @@ function hostedView(status) {
   const tenants = new Set(subscriptions.map((sub) => sub.tenant_id || status.config?.tenant_id || "")).size;
   const attempt = hosted.last_attempt && typeof hosted.last_attempt.status === "string" ? hosted.last_attempt : null;
   const backup = hosted.backup && typeof hosted.backup === "object" ? hosted.backup : null;
+  const retention = Number.isInteger(hosted.retention_days) && hosted.retention_days > 0 ? hosted.retention_days : null;
   const count = (value, noun) => `${value} ${noun}${value === 1 ? "" : "s"}`;
   return {
     label: "Hosted · read-only",
     schedule: `Daily at ${time} · ${zone}`,
-    explanation: `This hosted service collects every morning at ${time} (${zone}) with its own read-only Azure identity. ` +
+    explanation: `This hosted service collects every morning at ${time} (${zone}) with its own read-only Azure identity` +
+      (retention ? ` and keeps the last ${count(retention, "day")} of snapshots. ` : ". ") +
       "Collection, scope and schedule changes are made through its deployment, not in the browser.",
     scope: `${count(subscriptions.length, "subscription")} in ${count(tenants, "tenant")}, collected by the hosted service.`,
     subscriptions: subscriptions.map((sub) => ({ id: String(sub.id || ""), name: String(sub.name || sub.id || "") })),

@@ -24,6 +24,9 @@ param githubBranch string
 @description('IANA time zone for the daily collection.')
 param timeZone string
 
+@description('Days of snapshots the hosted database keeps.')
+param snapshotRetentionDays int
+
 param tags object
 
 var roles = {
@@ -101,6 +104,10 @@ resource site 'Microsoft.Web/sites@2024-04-01' = {
         {
           name: 'FOUNDRY_INVENTORY_SCOPE'
           value: inventoryScope
+        }
+        {
+          name: 'FOUNDRY_INVENTORY_RETENTION_DAYS'
+          value: string(snapshotRetentionDays)
         }
         {
           // Platform-level tenant pin in addition to the single-tenant issuer.
