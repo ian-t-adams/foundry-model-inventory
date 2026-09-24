@@ -12,7 +12,9 @@ default profile) and never signs in, signs out or changes the default subscripti
 3. Validates the Bicep template and prints a what-if summary. -ValidateOnly stops here.
 4. Creates or updates the single-tenant "Foundry inventory" app registration used by
    App Service authentication (ID token sign-in, no client secret) and its service principal.
-5. Deploys infra/main.bicep, keeping the image that GitHub Actions last deployed.
+5. Deploys infra/main.bicep, keeping the image that GitHub Actions last deployed. The
+   deploy identity trusts the OIDC subject GitHub presents for the repository's main
+   branch, which gh reads from the repository's settings (or pass -GitHubSubjectPrefix).
 6. Sets the app registration's redirect URI from the web app's actual host name.
 7. With -SetGitHubSecrets, stores the deployment settings as GitHub Actions secrets.
 
@@ -33,6 +35,7 @@ param(
     [ValidatePattern('^[-\w._()]{1,90}$')][string]$ResourceGroupName = 'rg-foundry-inventory',
     [string]$TimeZone = 'America/Chicago',
     [ValidatePattern('^[A-Za-z0-9-]+/[A-Za-z0-9._-]+$')][string]$GitHubRepository,
+    [ValidatePattern('^repo:[A-Za-z0-9-]+(@[0-9]+)?/[A-Za-z0-9._-]+(@[0-9]+)?$')][string]$GitHubSubjectPrefix,
     [string]$GitHubBranch = 'main',
     [string]$AppDisplayName = 'Foundry inventory',
     [switch]$ValidateOnly,
@@ -91,6 +94,26 @@ function New-ScratchFile([string]$Name, $Value) {
 }
 
 function Write-Step([string]$Text) { Write-Host "==> $Text" -ForegroundColor Cyan }
+
+function Get-GitHubSubjectPrefix([string]$Repository) {
+    # GitHub presents repo:<owner>@<owner-id>/<repo>@<repo-id> when the repository uses immutable
+    # subject claims (the default for repositories created since July 2026), else repo:<owner>/<repo>.
+    $null = Get-Command gh -CommandType Application -ErrorAction Stop
+    $text = (& gh api "repos/$Repository/actions/oidc/customization/sub" 2>$null) -join "`n"
+    if ($LASTEXITCODE -ne 0 -or -not $text) {
+        throw "Could not read the OIDC subject settings of $Repository with gh. Sign in to gh, or pass -GitHubSubjectPrefix."
+    }
+    $settings = $text | ConvertFrom-Json
+    if ($settings.use_default -ne $true) {
+        throw "$Repository uses a custom OIDC subject template; the deploy identity expects GitHub's default subject."
+    }
+    if ($settings.sub_claim_prefix) { return [string]$settings.sub_claim_prefix }
+    if ($settings.use_immutable_subject -ne $true) { return "repo:$Repository" }
+    $text = (& gh api "repos/$Repository" 2>$null) -join "`n"
+    if ($LASTEXITCODE -ne 0 -or -not $text) { throw "Could not read $Repository with gh." }
+    $info = $text | ConvertFrom-Json
+    return "repo:$($info.owner.login)@$($info.owner.id)/$($info.name)@$($info.id)"
+}
 
 $previousConfigDir = $env:AZURE_CONFIG_DIR
 try {
@@ -157,7 +180,12 @@ try {
         if ("$origin" -match 'github\.com[:/]([A-Za-z0-9-]+/[A-Za-z0-9._-]+?)(\.git)?/?$') { $GitHubRepository = $Matches[1] }
         else { throw 'Pass -GitHubRepository owner/name; the origin remote is not a GitHub repository.' }
     }
-    Write-Host "    Deploying branch: $GitHubRepository@$GitHubBranch"
+    if (-not $GitHubSubjectPrefix) { $GitHubSubjectPrefix = Get-GitHubSubjectPrefix $GitHubRepository }
+    $subjectPattern = '^repo:([A-Za-z0-9-]+)(?:@[0-9]+)?/([A-Za-z0-9._-]+)(?:@[0-9]+)?$'
+    if ($GitHubSubjectPrefix -notmatch $subjectPattern -or "$($Matches[1])/$($Matches[2])" -ine $GitHubRepository) {
+        throw "The OIDC subject prefix $GitHubSubjectPrefix does not belong to $GitHubRepository."
+    }
+    Write-Host "    Deploying branch: $GitHubRepository@$GitHubBranch (OIDC subject ${GitHubSubjectPrefix}:ref:refs/heads/$GitHubBranch)"
 
     Write-Step 'Checking the Microsoft.Web resource provider'
     $state = Invoke-Az -Arguments @('provider', 'show', '--namespace', 'Microsoft.Web', '--subscription', "$SubscriptionId", '--query', 'registrationState', '--output', 'tsv')
@@ -202,7 +230,7 @@ try {
             inventoryScope = @{ value = $scopeJson }
             readerSubscriptionIds = @{ value = @($subscriptions | ForEach-Object { $_.id }) }
             containerImage = @{ value = $currentImage }
-            githubRepository = @{ value = $GitHubRepository }
+            githubSubjectPrefix = @{ value = $GitHubSubjectPrefix }
             githubBranch = @{ value = $GitHubBranch }
             timeZone = @{ value = $TimeZone }
         }
