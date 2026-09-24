@@ -27,7 +27,7 @@ FORM: Instrument workbench, grounded direction 6, seed 247d456d. Historical stat
       </svg>
       <span><span class="brand-product">Foundry </span><strong>inventory</strong></span>
     </a>
-    <div class="local-label"><span class="status-dot" aria-hidden="true"></span>Local workspace</div>
+    <div class="local-label"><span class="status-dot" aria-hidden="true"></span><span id="workspace-mode">Local workspace</span></div>
     <div class="app-actions">
       <span id="scan-state" class="scan-state">Connecting…</span>
       <label class="appearance-control"><span class="sr-only">Appearance</span><select id="appearance-select" aria-label="Appearance"><option value="system">System</option><option value="light">Light</option><option value="dark">Dark</option></select></label>
@@ -35,6 +35,7 @@ FORM: Instrument workbench, grounded direction 6, seed 247d456d. Historical stat
         <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M16.4 6.5A7 7 0 1 0 17 12M16.5 2.5v4.8h-4.8" /></svg>
         <span>Collect now</span>
       </button>
+      <a id="sign-out" class="app-link" href="/.auth/logout" hidden>Sign out</a>
     </div>
   </header>
   <div class="workspace">
@@ -45,6 +46,7 @@ FORM: Instrument workbench, grounded direction 6, seed 247d456d. Historical stat
       </div>
       <p class="rail-description">Choose any combination. Selections within a filter are matched with “or”.</p>
       <form id="filters-form" class="filter-form">
+        <div id="filter-tenant"></div>
         <div id="filter-subscription"></div>
         <div id="filter-region"></div>
         <div id="filter-family"></div>
@@ -73,7 +75,7 @@ FORM: Instrument workbench, grounded direction 6, seed 247d456d. Historical stat
           </form>
         </details>
       </section>
-      <p class="local-note">Data stays on this computer.<br>No cloud database or telemetry.</p>
+      <p id="workspace-note" class="local-note">Data stays on this computer.<br>No cloud database or telemetry.</p>
     </aside>
     <main id="main-content" class="main-content" tabindex="-1">
       <div id="notice" class="notice" role="status" hidden></div>
@@ -183,11 +185,14 @@ FORM: Instrument workbench, grounded direction 6, seed 247d456d. Historical stat
         <div class="collection-layout">
           <section class="settings-section" aria-labelledby="scope-title">
             <div class="section-heading compact"><h3 id="scope-title">Collection scope</h3><button id="discover-button" class="button small" type="button">Discover subscriptions</button></div>
-            <p class="muted">Uses the subscriptions available to your current Azure CLI sign-in.</p>
+            <p id="scope-summary" class="muted" aria-live="polite">Discover subscriptions with your Azure CLI sign-in, then save the scope.</p>
+            <ul id="scope-list" class="scope-list" aria-label="Subscriptions collected by the hosted service" hidden></ul>
             <form id="config-form">
+              <label>Azure CLI profile directory<input id="profile-directory" type="text" autocomplete="off" spellcheck="false" placeholder="Configured or default CLI profile if empty"></label>
+              <p class="muted scope-hint">For another tenant, sign in with a separate profile under this checkout’s private data directory, then discover its subscriptions. Your other tenants stay selected.</p>
               <label>Tenant<select id="tenant-select"><option value="">Discover or load a tenant</option></select></label>
               <fieldset class="subscription-picker"><legend>Subscriptions to collect</legend><div id="subscription-choices"><p class="muted">No collection scope configured.</p></div></fieldset>
-              <button class="button primary" type="submit">Save collection scope</button>
+              <button class="button primary" type="submit">Save tenant scope</button>
             </form>
           </section>
           <section class="settings-section" aria-labelledby="schedule-title">
@@ -198,7 +203,7 @@ FORM: Instrument workbench, grounded direction 6, seed 247d456d. Historical stat
               <label>Local time<input type="time" id="schedule-time" value="07:00" required></label>
               <button class="button" type="submit">Save schedule</button>
             </form>
-            <p class="muted">Runs through Windows Task Scheduler even when this dashboard is closed. You must be signed into Windows and Azure CLI. A missed run starts when the computer is available.</p>
+            <p id="schedule-note" class="muted">Runs through Windows Task Scheduler even when this dashboard is closed. You must be signed into Windows and Azure CLI. A missed run starts when the computer is available.</p>
           </section>
         </div>
         <section class="history-section" aria-labelledby="history-title">
@@ -216,7 +221,7 @@ FORM: Instrument workbench, grounded direction 6, seed 247d456d. Historical stat
           </div>
         </details>
       </section>
-      <footer class="workspace-footer"><span>SQLite snapshots · read-only Azure access</span><span id="last-update">Waiting for local server</span></footer>
+      <footer class="workspace-footer"><span id="workspace-footer-note">SQLite snapshots · read-only Azure access</span><span id="last-update">Waiting for local server</span></footer>
     </main>
   </div>
   <div id="toast" class="toast" role="status" hidden></div>

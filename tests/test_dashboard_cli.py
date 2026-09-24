@@ -14,6 +14,11 @@ from dashboard.__main__ import import_snapshot, main, parser
 
 
 class CommandLineTests(unittest.TestCase):
+    PRIMARY = "10000000-0000-4000-8000-000000000001"
+    OTHER = "10000000-0000-4000-8000-000000000002"
+    SUB_A = "20000000-0000-4000-8000-000000000001"
+    SUB_B = "20000000-0000-4000-8000-000000000002"
+
     def test_command_arguments_match_scheduler(self):
         args = parser().parse_args(
             ["collect", "--source", "scheduled", "--data-dir", r"D:\example\data"]
@@ -21,6 +26,88 @@ class CommandLineTests(unittest.TestCase):
         self.assertEqual(args.command, "collect")
         self.assertEqual(args.source, "scheduled")
         self.assertEqual(args.data_dir, Path(r"D:\example\data"))
+
+    def test_configure_discovers_and_saves_the_explicit_cli_profile(self):
+        tenant = "10000000-0000-4000-8000-000000000001"
+        subscription = "20000000-0000-4000-8000-000000000001"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            profile = root / "data" / "azure-cli"
+            with (
+                patch("dashboard.__main__.ROOT", root),
+                patch("dashboard.__main__.Store"),
+                patch("dashboard.__main__.Collector") as collector,
+                redirect_stdout(io.StringIO()),
+            ):
+                collector.return_value.discover_subscriptions.return_value = [{
+                    "id": subscription, "tenant_id": tenant, "name": "Fixture", "state": "Enabled",
+                }]
+                collector.return_value.save_config.return_value = {}
+                result = main([
+                    "configure", "--tenant-id", tenant, "--subscription-id", subscription,
+                    "--azure-config-dir", str(profile),
+                ])
+            self.assertEqual(result, 0)
+            collector.return_value.discover_subscriptions.assert_called_once_with(str(profile.resolve()))
+            collector.return_value.save_config.assert_called_once_with({
+                "tenant_id": tenant, "subscriptions": [{"id": subscription, "name": "Fixture"}],
+                "morning_time": "07:00", "azure_config_dir": str(profile.resolve()),
+            })
+
+    def test_configure_adds_a_verified_other_tenant_without_replacing_existing_scope(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            profile = root / "data" / "other-profile"
+            existing = {
+                "tenant_id": self.PRIMARY,
+                "subscriptions": [{"id": self.SUB_A, "name": "Primary"}],
+                "azure_config_dir": str(root / "data" / "primary-profile"),
+                "morning_time": "08:15",
+            }
+            with (
+                patch("dashboard.__main__.ROOT", root),
+                patch("dashboard.__main__.Store"),
+                patch("dashboard.__main__.Collector") as collector,
+                redirect_stdout(io.StringIO()),
+            ):
+                collector.return_value.load_config.return_value = existing
+                collector.return_value.discover_subscriptions.return_value = [{
+                    "id": self.SUB_B, "tenant_id": self.OTHER, "name": "Other",
+                    "state": "Enabled",
+                }]
+                collector.return_value.save_config.return_value = {}
+                args = [
+                    "configure", "--add", "--tenant-id", self.OTHER,
+                    "--subscription-id", self.SUB_B, "--azure-config-dir", str(profile),
+                ]
+                self.assertEqual(main(args), 0)
+            collector.return_value.discover_subscriptions.assert_called_once_with(str(profile.resolve()))
+            collector.return_value.save_config.assert_called_once_with({
+                **existing,
+                "subscriptions": [
+                    *existing["subscriptions"],
+                    {"id": self.SUB_B, "name": "Other", "tenant_id": self.OTHER},
+                ],
+                "tenant_profiles": {self.OTHER: str(profile.resolve())},
+            }, expected_config=existing)
+
+    def test_configure_add_requires_a_profile_before_discovery(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with (
+                patch("dashboard.__main__.ROOT", root),
+                patch("dashboard.__main__.Store"),
+                patch("dashboard.__main__.Collector") as collector,
+                self.assertLogs(level="ERROR") as logs,
+            ):
+                result = main([
+                    "configure", "--add", "--tenant-id", self.OTHER,
+                    "--subscription-id", self.SUB_B,
+                ])
+            self.assertEqual(result, 1)
+            self.assertIn("--azure-config-dir", logs.output[0])
+            collector.return_value.discover_subscriptions.assert_not_called()
+            collector.return_value.save_config.assert_not_called()
 
     def test_import_uses_original_observation_time(self):
         with tempfile.TemporaryDirectory() as directory:

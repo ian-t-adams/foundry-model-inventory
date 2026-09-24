@@ -23,8 +23,13 @@ collection settings are adjacent views, not a separate application.
 
 ## Structure
 
-The 66px application bar holds identity and collection. A 248px filter rail
-holds scope, model and deployment filters plus browser-local saved views.
+The 66px application bar holds identity and collection. The filter rail holds
+tenant, subscription, model and deployment filters plus browser-local saved views.
+It sizes itself to the longest label the loaded snapshot can show, so tenant IDs and
+subscription and model names stay on one line, between a 224-265px floor that follows
+the window width and 400px. Above that floor it leaves at least 870px of the window for
+the quota table, or 1160px while model details sit beside it. Its width follows the
+snapshot, the window and the details column, never the filter being opened or edited.
 The main area contains a snapshot selector, three view tabs, a compact summary,
 and the inventory table. A compact, clickable bar chart and grouped table views
 expose family -> model -> model/version -> deployment options. Breadcrumbs
@@ -53,5 +58,30 @@ sets of model names and version strings. It is a dependent step: choose model
 names first, then their versions. Changing parent models resets version choices
 without clearing unrelated scope filters.
 
+Collection settings use an explicit private CLI profile to discover each tenant.
+Saving a tenant's subscription choices preserves other configured tenants.
+The status surface distinguishes the configured scope from an older complete
+snapshot that does not yet contain it.
+
 Do not replace snapshot health with a generic success indicator. Do not label
 unallocated quota as guaranteed deployable capacity.
+
+## Hosted, read-only mode
+
+The hosted dashboard is the same Operate surface with the same tokens, layout and
+views. `/api/status` reports `read_only`, and the interface then removes every
+control that would change collection instead of disabling it in place:
+
+- The application bar reads **Hosted · read-only**. **Collect now** is replaced
+  by a quiet **Sign out** text link that names the signed-in account in its
+  tooltip.
+- Collection & history keeps its two sections. Scope becomes a read-only list of
+  the collected subscriptions. Morning collection shows the daily time and time
+  zone, the next run, the latest attempt as a status label, the state of the
+  persistent copy and the deployed commit, followed by one sentence explaining
+  that the service collects on its own and is changed through its deployment.
+- Empty states, notices and the stale-data warning point to the hosted schedule
+  and Collection & history, never to Collect now. A failed attempt shows one
+  concise diagnostic, not a traceback.
+- The rail note and footer state that the data is hosted, requires Microsoft
+  Entra sign-in and comes from a specific commit.

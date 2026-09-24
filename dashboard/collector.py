@@ -101,6 +101,42 @@ def _detail(value: Any, limit: int = 1400) -> str:
     return text if len(text) <= limit else "[truncated] " + text[-limit:]
 
 
+def summarize_collection_errors(messages: list[str], tenant_id: str = "") -> str:
+    """Keep recovery guidance concise without changing stored diagnostics."""
+    details = []
+    missing_account = False
+    for message in messages:
+        text = _redact(message).strip()
+        if re.search(r"\bdoes not exist in (?:the )?MSAL token cache\b", text, re.I):
+            missing_account = True
+        elif text:
+            details.append(text)
+    detail = "; ".join(dict.fromkeys(details))
+    if not missing_account:
+        return _detail(detail)
+    tenant = tenant_id if _GUID.fullmatch(tenant_id) else "<affected-tenant-id>"
+    recovery = (
+        "Azure CLI sign-in is required: the account does not exist in MSAL token cache. "
+        f'Run az login --tenant "{tenant}" in a terminal as the same Windows user and '
+        "with the same AZURE_CONFIG_DIR as the collector, then select Collect now."
+    )
+    return recovery + (" " + _detail(detail, 1400 - len(recovery) - 1) if detail else "")
+
+
+def auth_failure_tenant(config: dict, failures: list[dict]) -> str:
+    tenants = {
+        item["id"]: item.get("tenant_id", config["tenant_id"])
+        for item in config.get("subscriptions", [])
+    }
+    affected = {
+        tenants.get(failure["subscription_id"])
+        for failure in failures
+        if re.search(r"\bdoes not exist in (?:the )?MSAL token cache\b",
+                     failure["message"], re.I)
+    }
+    return next(iter(affected)) if len(affected) == 1 and None not in affected else ""
+
+
 def _guid(value: Any, field: str) -> str:
     if not isinstance(value, str) or not _GUID.fullmatch(value):
         raise ValueError(f"{field} must be a UUID in hyphenated form.")
@@ -261,11 +297,22 @@ class Collector:
         self.lock_path = self.data_dir / "collection.lock"
         self._thread: threading.Thread | None = None
 
-    @staticmethod
-    def _validate_config(payload: Any) -> dict:
+    def _profile_directory(self, value: Any) -> Path:
+        if (
+            not isinstance(value, str) or not value or len(value) > 4096
+            or any(ord(char) < 32 for char in value) or not Path(value).is_absolute()
+        ):
+            raise ValueError("azure_config_dir must be an absolute, single-line directory path.")
+        directory = Path(value).resolve()
+        if not directory.is_relative_to(self.repo_root / "data"):
+            raise ValueError("azure_config_dir must remain under the repository's ignored data directory.")
+        return directory
+
+    def _validate_config(self, payload: Any) -> dict:
         if not isinstance(payload, dict):
             raise ValueError("Configuration must be a JSON object.")
-        if set(payload) - {"tenant_id", "subscriptions", "morning_time"}:
+        if set(payload) - {"tenant_id", "subscriptions", "morning_time",
+                           "azure_config_dir", "tenant_profiles"}:
             raise ValueError("Configuration contains unsupported fields.")
         tenant = _guid(payload.get("tenant_id"), "tenant_id")
         subscriptions = payload.get("subscriptions")
@@ -274,11 +321,12 @@ class Collector:
         seen = set()
         scope = []
         for item in subscriptions:
-            if not isinstance(item, dict) or set(item) - {"id", "name"}:
-                raise ValueError("Each subscription must contain only id and name.")
+            if not isinstance(item, dict) or set(item) - {"id", "name", "tenant_id"}:
+                raise ValueError("Each subscription must contain only id, name, and optional tenant_id.")
             subscription = _guid(item.get("id"), "Subscription id")
             if subscription in seen:
                 raise ValueError("Duplicate subscription ids are not allowed.")
+            subscription_tenant = _guid(item.get("tenant_id", tenant), "Subscription tenant_id")
             name = item.get("name", subscription)
             if (
                 not isinstance(name, str)
@@ -288,12 +336,32 @@ class Collector:
             ):
                 raise ValueError("Subscription names must be nonempty, single-line text.")
             seen.add(subscription)
-            scope.append({"id": subscription, "name": name.strip()})
-        return {
+            selected = {"id": subscription, "name": name.strip()}
+            if subscription_tenant != tenant:
+                selected["tenant_id"] = subscription_tenant
+            scope.append(selected)
+        other_tenants = {item["tenant_id"] for item in scope if "tenant_id" in item}
+        supplied_profiles = payload.get("tenant_profiles", {})
+        if not isinstance(supplied_profiles, dict) or len(supplied_profiles) > 100:
+            raise ValueError("tenant_profiles must map configured tenants to private Azure CLI directories.")
+        profiles = {}
+        for tenant_id, path in supplied_profiles.items():
+            scoped_tenant = _guid(tenant_id, "tenant_profiles tenant id")
+            if scoped_tenant in profiles or scoped_tenant == tenant or scoped_tenant not in other_tenants:
+                raise ValueError("tenant_profiles must contain one profile for each additional tenant.")
+            profiles[scoped_tenant] = str(self._profile_directory(path))
+        if set(profiles) != other_tenants:
+            raise ValueError("Each additional tenant requires its own explicit tenant_profiles entry.")
+        config = {
             "tenant_id": tenant,
             "subscriptions": scope,
             "morning_time": _clock(payload.get("morning_time", DEFAULT_TIME)),
         }
+        if "azure_config_dir" in payload:
+            config["azure_config_dir"] = str(self._profile_directory(payload["azure_config_dir"]))
+        if profiles:
+            config["tenant_profiles"] = profiles
+        return config
 
     @staticmethod
     def _read_json(path: Path) -> Any:
@@ -309,11 +377,68 @@ class Collector:
             return {"tenant_id": "", "subscriptions": [], "morning_time": DEFAULT_TIME}
         return self._validate_config(self._read_json(self.config_path))
 
-    def save_config(self, payload: dict) -> dict:
-        config = self._validate_config(payload)
+    def save_config(self, payload: dict, *, expected_config: dict | None = None) -> dict:
         with _FileLock(self.lock_path):
+            if not isinstance(payload, dict):
+                raise ValueError("Configuration must be a JSON object.")
+            payload = dict(payload)
+            if expected_config is not None and self.load_config() != expected_config:
+                raise RuntimeError("Collection scope changed during discovery; retry adding subscriptions.")
+            if self.config_path.exists():
+                previous = self.load_config()
+                same_tenant = _guid(payload.get("tenant_id"), "tenant_id") == previous["tenant_id"]
+                if "tenant_profiles" not in payload and "tenant_profiles" in previous:
+                    if not same_tenant:
+                        raise ValueError(
+                            "Changing the primary tenant requires explicit additional-tenant scope."
+                        )
+                    supplied = payload.get("subscriptions")
+                    if not isinstance(supplied, list):
+                        raise ValueError("Configure between 1 and 100 subscriptions.")
+                    extras = {
+                        item["id"]: item for item in previous["subscriptions"]
+                        if "tenant_id" in item
+                    }
+                    retained = []
+                    for item in supplied:
+                        key = item.get("id") if isinstance(item, dict) else None
+                        old = extras.get(key.lower()) if isinstance(key, str) else None
+                        retained.append(
+                            {**item, "tenant_id": old["tenant_id"]}
+                            if old and "tenant_id" not in item else item
+                        )
+                    ids = {
+                        item["id"].lower() for item in retained
+                        if isinstance(item, dict) and isinstance(item.get("id"), str)
+                    }
+                    payload["subscriptions"] = retained + [
+                        item for item in extras.values() if item["id"] not in ids
+                    ]
+                    payload["tenant_profiles"] = previous["tenant_profiles"]
+                if (same_tenant
+                        and "azure_config_dir" not in payload
+                        and "azure_config_dir" in previous):
+                    payload["azure_config_dir"] = previous["azure_config_dir"]
+            config = self._validate_config(payload)
             _atomic_json(self.config_path, config)
         return config
+
+    def _azure_environment(self, azure_config_dir: str | None = None) -> dict | None:
+        directory = (
+            self.load_config().get("azure_config_dir")
+            if azure_config_dir is None else azure_config_dir
+        )
+        if directory is None:
+            return None
+        profile = self._profile_directory(directory)
+        if not profile.is_dir():
+            raise RuntimeError(
+                f"Azure CLI profile directory is unavailable: {profile}. "
+                "Restore the selected directory; shared credentials will not be used."
+            )
+        env = os.environ.copy()
+        env["AZURE_CONFIG_DIR"] = str(profile)
+        return env
 
     def _powershell(self) -> str:
         names = ("pwsh.exe", "powershell.exe") if _WINDOWS else ("pwsh", "powershell")
@@ -402,7 +527,7 @@ class Collector:
         except (ValueError, AttributeError):
             raise RuntimeError(f"{label} returned invalid JSON, not a successful response.") from None
 
-    def discover_subscriptions(self) -> list[dict]:
+    def discover_subscriptions(self, azure_config_dir: str | None = None) -> list[dict]:
         executable = shutil.which("az")
         if not executable:
             raise RuntimeError("Azure CLI is unavailable. Install it and sign in with az login.")
@@ -413,7 +538,7 @@ class Collector:
             self._powershell(), "-NoLogo", "-NoProfile", "-NonInteractive",
             "-EncodedCommand", encoded,
         ]
-        env = os.environ.copy()
+        env = self._azure_environment(azure_config_dir) or os.environ.copy()
         env["FOUNDRY_INVENTORY_AZ_CLI"] = str(Path(executable).resolve())
         accounts = self._json_command(command, "Azure subscription discovery", env)
         if not isinstance(accounts, list):
@@ -502,6 +627,8 @@ class Collector:
             config = self.load_config()
             if not config["subscriptions"]:
                 raise ValueError("Configure a tenant and subscriptions before collecting.")
+            if "azure_config_dir" in config:
+                self._azure_environment(config["azure_config_dir"])
             previous = self._read_status()
             if previous["running"]:
                 interrupted = self._interrupted(previous)
@@ -635,7 +762,8 @@ class Collector:
             raise ValueError("Coverage CSV omits observed regions.")
 
     def _subscription(
-        self, subscription: dict, tenant: str, run_dir: Path, timeout: float
+        self, subscription: dict, tenant: str, run_dir: Path, timeout: float,
+        azure_config_dir: str | None = None,
     ) -> tuple[Path | None, str | None]:
         subscription_id = subscription["id"]
         command = self._ps_file("run-foundry-subscription-inventory.ps1") + [
@@ -646,7 +774,9 @@ class Collector:
         problems = []
         stdout = stderr = ""
         try:
-            result = self._run_command(command, timeout)
+            result = self._run_command(
+                command, timeout, env=self._azure_environment(azure_config_dir)
+            )
             stdout, stderr = result.stdout, result.stderr
             if result.returncode:
                 reason = _detail(stderr or stdout) or "No diagnostic output."
@@ -656,6 +786,8 @@ class Collector:
             problems.append(f"Subscription collection timed out after {int(timeout)} seconds.")
         except OSError as exc:
             problems.append(f"Could not launch subscription collector: {_detail(exc)}")
+        except RuntimeError as exc:
+            problems.append(f"Subscription collector unavailable: {_detail(exc)}")
         for suffix, text in (("stdout.log", stdout), ("stderr.log", stderr)):
             (run_dir / f"{subscription_id}.{suffix}").write_text(_redact(text), encoding="utf-8")
         transcript = run_dir / f"{subscription_id}.log"
@@ -666,13 +798,15 @@ class Collector:
         try:
             regions = self._inspect_csv(path, subscription_id, tenant)
         except (OSError, UnicodeError, csv.Error, ValueError) as exc:
-            problems.append(f"Inventory CSV is unavailable or invalid: {_detail(exc)}")
+            if not problems or not isinstance(exc, FileNotFoundError):
+                problems.append(f"Inventory CSV is unavailable or invalid: {_detail(exc)}")
             path = None
         if path is not None:
             try:
                 self._inspect_coverage(run_dir / f"{subscription_id}-coverage.csv", subscription_id, regions)
             except (OSError, UnicodeError, csv.Error, ValueError) as exc:
-                problems.append(f"Coverage CSV is unavailable or invalid: {_detail(exc)}")
+                if not problems or not isinstance(exc, FileNotFoundError):
+                    problems.append(f"Coverage CSV is unavailable or invalid: {_detail(exc)}")
         return path, _detail("; ".join(problems)) if problems else None
 
     def _collect(self, lock: _FileLock, config: dict, status: dict, run_dir: Path) -> dict:
@@ -686,18 +820,26 @@ class Collector:
                 status["message"] = f"Collecting {subscription['name']}."
                 self._write_status(status)
                 remaining = deadline - time.monotonic()
+                tenant = subscription.get("tenant_id", config["tenant_id"])
+                profile = (
+                    config.get("azure_config_dir") if tenant == config["tenant_id"]
+                    else config["tenant_profiles"][tenant]
+                )
                 if remaining <= 0:
                     path, error = None, "The overall collection time limit was reached."
                 else:
                     path, error = self._subscription(
-                        subscription, config["tenant_id"], run_dir,
-                        min(SUBSCRIPTION_TIMEOUT, remaining),
+                        subscription, tenant, run_dir, min(SUBSCRIPTION_TIMEOUT, remaining),
+                        profile,
                     )
                 if path is not None:
                     paths.append(path)
                 if error:
                     failures.append({"subscription_id": subscription["id"], "message": error})
-                    status["last_error"] = error
+                    status["last_error"] = summarize_collection_errors(
+                        [item["message"] for item in failures],
+                        auth_failure_tenant(config, failures),
+                    )
                 status["progress"]["completed"] += 1
                 self._write_status(status)
             result = self.store.ingest_csvs(
@@ -714,7 +856,10 @@ class Collector:
                 running=False,
                 message="Collection complete." if outcome == "complete" else f"Collection {outcome}; inspect scan errors.",
                 last_error=None if outcome == "complete" else (
-                    _detail("; ".join(item["message"] for item in failures))
+                    summarize_collection_errors(
+                        [item["message"] for item in failures],
+                        auth_failure_tenant(config, failures),
+                    )
                     or f"Collection {outcome}; catalog or quota errors are recorded in scan history."
                 ),
             )

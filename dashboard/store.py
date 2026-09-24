@@ -52,6 +52,7 @@ _REPORT_COLUMNS = {
     "SkuDeprecation", "Notes",
 }
 _FILTER_COLUMNS = {
+    "tenant": "tenant_id",
     "subscription": "subscription_id",
     "region": "region",
     "family": "family",
@@ -1185,8 +1186,8 @@ class Store:
             for field in _FILTER_COLUMNS:
                 if field == "subscription":
                     continue
-                table = "coverage" if field == "region" else "inventory"
-                column = _FAMILY_SQL if field == "family" else field
+                table = "coverage" if field in {"tenant", "region"} else "inventory"
+                column = _FAMILY_SQL if field == "family" else _FILTER_COLUMNS[field]
                 result[field] = [row[0] for row in db.execute(
                     f"SELECT DISTINCT {column} AS {field} FROM {table} WHERE scan_id=? AND {column}!='' "
                     f"ORDER BY {field} COLLATE NOCASE", (scan_id,),

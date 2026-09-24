@@ -1,37 +1,45 @@
-import { MultiSelect, closeMultiSelects } from "./controls.js";
+import { MultiSelect, closeMultiSelects, measureChoices } from "./controls.js";
 
 const $ = (id) => document.getElementById(id);
-const multiKeys = ["subscription", "region", "family", "model", "model_version", "deployment_type",
+const multiKeys = ["tenant", "subscription", "region", "family", "model", "model_version", "deployment_type",
   "capacity_type", "availability", "lifecycle", "unit"];
 const filterKeys = [...multiKeys, "version", "minimum", "quota_name", "sku"];
 const filterLabels = {
-  subscription: "Subscription", region: "Region", family: "Family", model: "Model",
+  tenant: "Tenant", subscription: "Subscription", region: "Region", family: "Family", model: "Model",
   model_version: "Model + version", version: "Legacy version", deployment_type: "Geography", capacity_type: "Capacity",
   availability: "Headroom", lifecycle: "Lifecycle", unit: "Unit", minimum: "Minimum",
   quota_name: "Quota pool", sku: "SKU",
 };
 const defaultOptions = {
-  subscription: "All subscriptions", region: "All regions", family: "All families",
+  tenant: "All tenants", subscription: "All subscriptions", region: "All regions", family: "All families",
   model: "All models", model_version: "Choose a model first", deployment_type: "All geographies",
   capacity_type: "All capacity types", availability: "Any quota state",
   lifecycle: "All lifecycle states", unit: "All units",
 };
+const availabilityOptions = [
+  { value: "available", label: "Has remaining quota" },
+  { value: "exhausted", label: "No remaining quota" },
+  { value: "unknown", label: "Quota unknown" },
+];
 const controls = new Map();
 const viewNames = { quota: "quota entries", deployments: "catalog options", family: "families", model: "models", model_version: "model/version choices" };
 const state = {
   filters: {}, snapshot: "latest", page: 1, pageSize: 50, sort: "remaining", direction: "desc",
   q: "", tab: "inventory", csrf: "", status: null, scans: [], rows: [],
-  subscriptions: [], config: null, request: 0, compareRequest: 0, comparePage: 1, initialized: false,
+  subscriptions: [], config: null, discoveredProfiles: new Map(),
+  request: 0, compareRequest: 0, comparePage: 1, initialized: false,
   facets: {}, view: "quota", trail: [], chartVisible: true,
 };
 const numberFormat = new Intl.NumberFormat(undefined, { maximumFractionDigits: 3 });
 const dateFormat = new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
 const savedKey = "foundry-inventory.saved-views.v1";
+const railKey = "foundry-inventory.rail-width.v1";
 let toastTimeout;
 let searchTimeout;
 let pollPending = false;
 let coverageLoaded = false;
 let filterTimeout;
+let railFrame = 0;
 
 function el(tag, className, text) {
   const node = document.createElement(tag);
@@ -131,7 +139,9 @@ async function api(path, body) {
   try {
     response = await fetch(path, options);
   } catch {
-    throw new Error("The local server is unreachable. Start the dashboard and try again.");
+    throw new Error(state.status?.read_only ?
+      "The hosted dashboard is unreachable or your sign-in expired. Reload the page to sign in again." :
+      "The local server is unreachable. Start the dashboard and try again.");
   }
   const contentType = response.headers.get("content-type") || "";
   const data = contentType.includes("application/json") ? await response.json() : null;
@@ -249,6 +259,16 @@ function renderFacets(facets) {
   updateChoiceOptions();
   syncFilterControls();
   renderFilterChips();
+  fitFilterRail();
+}
+
+function versionChoice(option, singleModel) {
+  return {
+    ...option,
+    label: singleModel ? option.version || "(version not reported)" : option.label,
+    description: singleModel ? `${option.model} · ${option.format}` : option.format,
+    searchText: option.label,
+  };
 }
 
 function updateChoiceOptions() {
@@ -256,23 +276,14 @@ function updateChoiceOptions() {
   const families = new Set(selected("family"));
   const models = new Set(selected("model"));
   const eligiblePairs = models.size ? pairs.filter((option) =>
-    (!families.size || families.has(option.family)) && models.has(option.model)).map((option) => ({
-    ...option,
-    label: models.size === 1 ? option.version || "(version not reported)" : option.label,
-    description: models.size === 1 ? `${option.model} · ${option.format}` : option.format,
-    searchText: option.label,
-  })) : [];
+    (!families.size || families.has(option.family)) && models.has(option.model))
+    .map((option) => versionChoice(option, models.size === 1)) : [];
   const eligibleModels = families.size ?
     [...new Set(pairs.filter((option) => families.has(option.family)).map((option) => option.model))].sort() :
     state.facets.model || [];
-  const availability = [
-    { value: "available", label: "Has remaining quota" },
-    { value: "exhausted", label: "No remaining quota" },
-    { value: "unknown", label: "Quota unknown" },
-  ];
   for (const [key, control] of controls) {
     control.setOptions(key === "model_version" ? eligiblePairs :
-      key === "model" ? eligibleModels : key === "availability" ? availability : state.facets[key] || []);
+      key === "model" ? eligibleModels : key === "availability" ? availabilityOptions : state.facets[key] || []);
   }
   controls.get("model_version").setContext({
     disabled: !models.size,
@@ -280,6 +291,53 @@ function updateChoiceOptions() {
     hint: models.size === 1 ? `Only versions of ${[...models][0]} are shown.` :
       models.size > 1 ? `Versions are scoped to your ${models.size} selected models.` : "",
   });
+}
+
+// The longest labels any filter can show for this snapshot, independent of the current selection, so
+// the rail keeps one width while the user filters. Character count tracks rendered width closely
+// enough that only these candidates need a layout pass.
+function railChoices(facets, limit = 48) {
+  const choices = [...Object.values(defaultOptions), "All versions"].map((label) => ({ label }));
+  for (const key of multiKeys) {
+    const options = key === "availability" ? availabilityOptions : key === "model_version" ? [] : facets[key] || [];
+    for (const option of options) choices.push({ label: typeof option === "string" ? option : option.label });
+  }
+  for (const option of facets.model_version || []) choices.push(versionChoice(option, false), versionChoice(option, true));
+  const size = ({ label, description }) => Math.max(String(label ?? "").length, String(description ?? "").length);
+  return choices.sort((a, b) => size(b) - size(a)).slice(0, limit);
+}
+
+function setRailContent(width) {
+  document.querySelector(".workspace").style.setProperty("--rail-content", `${width}px`);
+  syncRailGutter();
+}
+
+function syncRailGutter() {
+  const rail = document.querySelector(".filter-rail");
+  const style = getComputedStyle(rail);
+  if (!rail.offsetWidth || style.overflowY === "visible") return;
+  const gutter = rail.offsetWidth - rail.clientWidth -
+    parseFloat(style.borderLeftWidth) - parseFloat(style.borderRightWidth);
+  rail.parentElement.style.setProperty("--rail-gutter", `${Math.max(0, gutter)}px`);
+}
+
+function fitFilterRail() {
+  const width = measureChoices(railChoices(state.facets)) + 1;
+  setRailContent(width);
+  try {
+    localStorage.setItem(railKey, String(width));
+  } catch {
+    // Without storage the rail still fits; the next page load starts from the default width.
+  }
+}
+
+function restoreRailWidth() {
+  try {
+    const width = Number(localStorage.getItem(railKey));
+    if (width > 0 && width <= 1000) setRailContent(width);
+  } catch {
+    // Browser storage only avoids a width change on load; the rail is fitted after data arrives.
+  }
 }
 
 function changeFilter(key, values) {
@@ -451,6 +509,14 @@ function finishTable(data) {
   renderBreadcrumbs();
 }
 
+function emptyEstate() {
+  return state.status?.read_only ? {
+    title: "Waiting for the first hosted collection",
+    text: "The hosted service collects every morning with read-only access. Collection & history shows its latest attempt and next run.",
+    action: "View collection status",
+  } : null;
+}
+
 function renderInventory(data) {
   state.rows = data.rows;
   renderTableHeader();
@@ -459,10 +525,11 @@ function renderInventory(data) {
   body.replaceChildren();
   if (!data.rows.length) {
     if (!data.snapshot) {
-      const button = el("button", "button primary", "Set up collection");
+      const hosted = emptyEstate();
+      const button = el("button", "button primary", hosted?.action || "Set up collection");
       button.type = "button";
       button.addEventListener("click", () => selectTab("collection"));
-      body.append(emptyRow(7, "Your estate, ready to explore", "Choose the subscriptions to collect, then take your first snapshot. Existing CSVs can also be imported from the command line.", button));
+      body.append(emptyRow(7, hosted?.title || "Your estate, ready to explore", hosted?.text || "Choose the subscriptions to collect, then take your first snapshot. Existing CSVs can also be imported from the command line.", button));
     } else {
       body.append(emptyRow(7, "No entries match these filters", "Try a different region or capacity type, or reset your filters. Unknown quota is kept separate from zero."));
     }
@@ -529,12 +596,13 @@ function renderQuota(data) {
   const body = $("inventory-body");
   body.replaceChildren();
   if (!data.rows.length) {
-    const setup = el("button", "button primary", "Set up collection");
+    const hosted = emptyEstate();
+    const setup = el("button", "button primary", hosted?.action || "Set up collection");
     setup.type = "button";
     setup.addEventListener("click", () => selectTab("collection"));
-    body.append(emptyRow(4, data.snapshot ? "No quota entries match this selection" : "Collect your first quota snapshot",
+    body.append(emptyRow(4, data.snapshot ? "No quota entries match this selection" : hosted?.title || "Collect your first quota snapshot",
       data.snapshot ? "Try another region, model or deployment type, or lower the minimum. Missing quota is never treated as zero." :
-        "Choose your subscriptions in Collection & history to see reported quota here.", data.snapshot ? null : setup));
+        hosted?.text || "Choose your subscriptions in Collection & history to see reported quota here.", data.snapshot ? null : setup));
   }
   for (const pool of data.rows) {
     const row = el("tr");
@@ -927,10 +995,113 @@ async function viewSnapshot(id) {
   renderHistory(state.scans);
 }
 
+function hostedView(status) {
+  if (!status || status.read_only !== true) return null;
+  const hosted = status.hosted || {};
+  const time = /^([01]\d|2[0-3]):[0-5]\d$/.test(hosted.collection_time || "") ? hosted.collection_time : "07:00";
+  const zone = typeof hosted.timezone === "string" && hosted.timezone.trim() ? hosted.timezone.trim() : "UTC";
+  const commit = /^[0-9a-f]{7,40}$/.test(hosted.commit || "") ? hosted.commit : "";
+  const subscriptions = Array.isArray(status.config?.subscriptions) ? status.config.subscriptions : [];
+  const tenants = new Set(subscriptions.map((sub) => sub.tenant_id || status.config?.tenant_id || "")).size;
+  const attempt = hosted.last_attempt && typeof hosted.last_attempt.status === "string" ? hosted.last_attempt : null;
+  const backup = hosted.backup && typeof hosted.backup === "object" ? hosted.backup : null;
+  const count = (value, noun) => `${value} ${noun}${value === 1 ? "" : "s"}`;
+  return {
+    label: "Hosted · read-only",
+    schedule: `Daily at ${time} · ${zone}`,
+    explanation: `This hosted service collects every morning at ${time} (${zone}) with its own read-only Azure identity. ` +
+      "Collection, scope and schedule changes are made through its deployment, not in the browser.",
+    scope: `${count(subscriptions.length, "subscription")} in ${count(tenants, "tenant")}, collected by the hosted service.`,
+    subscriptions: subscriptions.map((sub) => ({ id: String(sub.id || ""), name: String(sub.name || sub.id || "") })),
+    commit: commit ? commit.slice(0, 7) : "not recorded",
+    commitTitle: commit || "This build did not record its commit.",
+    nextRun: typeof hosted.next_run === "string" ? hosted.next_run : null,
+    attempt: attempt ? { status: attempt.status, at: attempt.completed_at || attempt.started_at || null } : null,
+    backup: backup?.error ? { error: String(backup.error) } :
+      backup?.saved_at ? { savedAt: backup.saved_at } :
+        backup?.restored_at ? { restoredAt: backup.restored_at } : null,
+    user: typeof hosted.user === "string" ? hosted.user.slice(0, 256) : "",
+  };
+}
+
+function statusNotice(data, now = Date.now()) {
+  const collecting = Boolean(data.collection?.running);
+  const hosted = data.read_only === true;
+  if (!data.configured) {
+    return hosted ?
+      { message: "The hosted service has no collection scope. Redeploy it with the subscriptions to collect.", type: "error" } :
+      { message: "Choose your tenant and subscriptions in Collection & history before starting a scan.", type: "" };
+  }
+  if (data.collection?.last_error && !collecting) {
+    const detail = String(data.collection.last_error).replace(/[.\s]+$/, "");
+    return { message: `The last collection needs attention: ${detail}. The latest complete snapshot is still available.`, type: "error" };
+  }
+  if (data.scope_pending && !collecting) {
+    return { message: hosted ?
+      "The latest complete snapshot does not cover every configured subscription yet. The next hosted collection includes them." :
+      "The latest complete snapshot does not cover the current tenant and subscription selection. Collect now to refresh the full scope.",
+    type: "warning" };
+  }
+  if (data.latest && now - new Date(data.latest.started_at).getTime() > 30 * 60 * 60 * 1000) {
+    return { message: hosted ?
+      "The latest complete snapshot is more than 30 hours old. Collection & history shows the hosted service's latest attempt." :
+      "The latest complete snapshot is more than 30 hours old. Collect now or check the morning schedule.",
+    type: "warning" };
+  }
+  return { message: "", type: "" };
+}
+
+function applyMode(hosted) {
+  if (!hosted) return;
+  document.title = "Foundry inventory — hosted";
+  $("workspace-mode").textContent = hosted.label;
+  $("workspace-note").replaceChildren("Hosted in your Azure subscription.", el("br"), "Microsoft Entra sign-in, read-only access.");
+  $("workspace-footer-note").textContent = `SQLite snapshots · read-only Azure access · commit ${hosted.commit}`;
+  $("workspace-footer-note").title = hosted.commitTitle;
+  $("scan-button").hidden = true;
+  $("discover-button").hidden = true;
+  $("config-form").hidden = true;
+  $("schedule-form").hidden = true;
+  const signOut = $("sign-out");
+  signOut.hidden = false;
+  signOut.title = hosted.user ? `Signed in as ${hosted.user}` : "Sign out of the hosted dashboard";
+  signOut.setAttribute("aria-label", hosted.user ? `Sign out ${hosted.user}` : "Sign out");
+}
+
+function renderHosted(hosted) {
+  $("scope-summary").textContent = hosted.scope;
+  const list = $("scope-list");
+  list.replaceChildren(...[...hosted.subscriptions].sort((a, b) => a.name.localeCompare(b.name)).map((sub) => {
+    const item = el("li", "", sub.name);
+    item.append(el("span", "cell-secondary", sub.id));
+    return item;
+  }));
+  list.hidden = !hosted.subscriptions.length;
+  const summary = $("schedule-summary");
+  summary.replaceChildren(el("span", "status-label complete", hosted.schedule));
+  summary.append(el("p", "", `Next collection: ${hosted.nextRun ? when(hosted.nextRun) : "being scheduled"}`));
+  if (hosted.attempt) {
+    const attempt = el("p", "", "Latest attempt: ");
+    attempt.append(el("span", `status-label ${hosted.attempt.status}`, hosted.attempt.status), ` ${when(hosted.attempt.at)}`);
+    summary.append(attempt);
+  } else {
+    summary.append(el("p", "", "Latest attempt: none yet. The first collection starts shortly after deployment."));
+  }
+  if (hosted.backup?.error) summary.append(el("p", "backup-warning", hosted.backup.error));
+  else if (hosted.backup?.savedAt) summary.append(el("p", "", `Persistent copy saved: ${when(hosted.backup.savedAt)}`));
+  else if (hosted.backup?.restoredAt) summary.append(el("p", "", `Restored from the persistent copy: ${when(hosted.backup.restoredAt)}`));
+  const commit = el("p", "", `Deployed commit: ${hosted.commit}`);
+  commit.title = hosted.commitTitle;
+  summary.append(commit);
+  $("schedule-note").textContent = hosted.explanation;
+}
+
 function applyStatus(data) {
   const previous = state.status;
   state.status = data;
   state.csrf = data.csrf_token;
+  const hosted = hostedView(data);
+  applyMode(hosted);
   const collecting = Boolean(data.collection?.running);
   $("scan-button").disabled = collecting;
   $("scan-button").querySelector("span").textContent = collecting ? "Collecting…" : "Collect now";
@@ -942,17 +1113,11 @@ function applyStatus(data) {
     $("scan-progress-bar").max = Math.max(1, progress.total || 1);
     $("scan-progress-bar").value = progress.completed || 0;
   }
-  renderSchedule(data.schedule);
+  if (!hosted) renderSchedule(data.schedule);
   if (!state.initialized) renderConfig(data.config);
-  if (!data.configured) {
-    notice("Choose your tenant and subscriptions in Collection & history before starting a scan.", "");
-  } else if (data.collection?.last_error && !collecting) {
-    notice(`The last collection needs attention: ${data.collection.last_error}. The latest complete snapshot is still available.`, "error");
-  } else if (data.latest && Date.now() - new Date(data.latest.started_at).getTime() > 30 * 60 * 60 * 1000) {
-    notice("The latest complete snapshot is more than 30 hours old. Collect now or check the morning schedule.", "warning");
-  } else {
-    notice("");
-  }
+  if (hosted) renderHosted(hosted);
+  const { message, type } = statusNotice(data);
+  notice(message, type);
   return previous && (previous.collection?.running && !collecting ||
     previous.latest?.id !== data.latest?.id);
 }
@@ -976,27 +1141,68 @@ function renderSchedule(schedule) {
   }
 }
 
-function renderConfig(config) {
+function collectionTenant(config, subscription) {
+  return subscription.tenant_id || config?.tenant_id || "";
+}
+
+function collectionProfile(config, tenant) {
+  if (!tenant) return "";
+  return tenant === config?.tenant_id ? config?.azure_config_dir || "" :
+    config?.tenant_profiles?.[tenant] || "";
+}
+
+function collectionPayload(config, tenant, subscriptions, profile, morningTime) {
+  if (!tenant || !subscriptions.length) throw new Error("Select a tenant and at least one enabled subscription.");
+  const primary = config?.tenant_id || tenant;
+  if (tenant !== primary && !profile) {
+    throw new Error("An additional tenant needs an explicit private Azure CLI profile.");
+  }
+  const retained = (config?.subscriptions || []).filter((item) => collectionTenant(config, item) !== tenant);
+  const selected = subscriptions.map(({ id, name }) =>
+    tenant === primary ? { id, name } : { id, name, tenant_id: tenant });
+  const updated = {
+    tenant_id: primary,
+    subscriptions: [...retained, ...selected],
+    morning_time: morningTime || config?.morning_time || "07:00",
+  };
+  const primaryProfile = tenant === primary ? profile || config?.azure_config_dir : config?.azure_config_dir;
+  if (primaryProfile) updated.azure_config_dir = primaryProfile;
+  const profiles = { ...config?.tenant_profiles };
+  if (tenant !== primary) profiles[tenant] = profile;
+  if (Object.keys(profiles).length) updated.tenant_profiles = profiles;
+  return updated;
+}
+
+function renderConfig(config, preferredTenant) {
   state.config = config;
   if (!config) return;
-  const selected = new Set((config.subscriptions || []).map((sub) => sub.id));
+  const previousTenant = preferredTenant || $("tenant-select").value;
   for (const sub of config.subscriptions || []) {
     if (!state.subscriptions.some((item) => item.id === sub.id)) {
-      state.subscriptions.push({ ...sub, tenant_id: config.tenant_id, state: "Enabled" });
+      state.subscriptions.push({ ...sub, tenant_id: collectionTenant(config, sub), state: "Enabled" });
     }
   }
   const tenants = [...new Set(state.subscriptions.map((sub) => sub.tenant_id))].sort();
-  populateSelect($("tenant-select"), tenants, "Select tenant", config.tenant_id);
-  renderSubscriptionChoices(selected);
+  const selectedTenant = tenants.includes(previousTenant) ? previousTenant : config.tenant_id || tenants[0];
+  populateSelect($("tenant-select"), tenants, "Select tenant", selectedTenant);
+  $("profile-directory").value = state.discoveredProfiles.get(selectedTenant) ??
+    collectionProfile(config, selectedTenant);
+  const scope = config.subscriptions || [];
+  const tenantCount = new Set(scope.map((sub) => collectionTenant(config, sub))).size;
+  $("scope-summary").textContent = scope.length ?
+    `${tenantCount} tenant${tenantCount === 1 ? "" : "s"} · ${scope.length} subscription${scope.length === 1 ? "" : "s"} saved for collection.` :
+    "Discover subscriptions with your Azure CLI sign-in, then save the scope.";
+  renderSubscriptionChoices();
 }
 
 function renderSubscriptionChoices(selectedIds) {
-  const selected = selectedIds || new Set([...$("subscription-choices").querySelectorAll("input:checked")].map((input) => input.value));
   const tenant = $("tenant-select").value;
+  const selected = selectedIds || new Set((state.config?.subscriptions || [])
+    .filter((sub) => collectionTenant(state.config, sub) === tenant).map((sub) => sub.id));
   const available = state.subscriptions.filter((sub) => sub.tenant_id === tenant && sub.state === "Enabled");
   const container = $("subscription-choices");
   container.replaceChildren();
-  if (!available.length) container.append(el("p", "muted", "No enabled subscriptions for this tenant. Discover subscriptions after signing in with Azure CLI."));
+  if (!available.length) container.append(el("p", "muted", "No enabled subscriptions in this profile. Sign in with Azure CLI, then discover again."));
   for (const sub of available.sort((a, b) => a.name.localeCompare(b.name))) {
     const label = el("label", "checkbox-label");
     const input = el("input");
@@ -1185,7 +1391,7 @@ async function pollStatus() {
       if (!status.collection?.last_error) toast("Collection finished. Your snapshot is ready.");
     }
   } catch (error) {
-    $("scan-state").textContent = "Server offline";
+    $("scan-state").textContent = state.status?.read_only ? "Connection lost" : "Server offline";
     notice(error.message, "error");
   } finally {
     pollPending = false;
@@ -1308,29 +1514,51 @@ function wireEvents() {
     button.disabled = true;
     button.textContent = "Discovering…";
     try {
-      state.subscriptions = (await api("/api/subscriptions")).subscriptions;
-      renderConfig(state.config || { tenant_id: "", subscriptions: [] });
-      toast(`Found ${state.subscriptions.length} subscriptions in your Azure CLI profile.`);
+      const profile = $("profile-directory").value.trim();
+      const found = (await (profile ?
+        api("/api/subscriptions", { azure_config_dir: profile }) :
+        api("/api/subscriptions"))).subscriptions;
+      for (const sub of found) {
+        state.discoveredProfiles.set(sub.tenant_id, profile);
+        const existing = state.subscriptions.findIndex((item) => item.id === sub.id);
+        if (existing === -1) state.subscriptions.push(sub);
+        else state.subscriptions[existing] = sub;
+      }
+      const foundTenants = [...new Set(found.map((sub) => sub.tenant_id))];
+      renderConfig(state.config || { tenant_id: "", subscriptions: [], morning_time: "07:00" },
+        foundTenants.length === 1 ? foundTenants[0] : $("tenant-select").value);
+      toast(`Found ${found.length} subscriptions in this Azure CLI profile.`);
     } finally {
       button.disabled = false;
       button.textContent = "Discover subscriptions";
     }
   }));
-  $("tenant-select").addEventListener("change", () => renderSubscriptionChoices(new Set()));
+  $("tenant-select").addEventListener("change", () => {
+    const tenant = $("tenant-select").value;
+    $("profile-directory").value = state.discoveredProfiles.get(tenant) ??
+      collectionProfile(state.config, tenant);
+    renderSubscriptionChoices();
+  });
   $("config-form").addEventListener("submit", (event) => {
     event.preventDefault();
     handled(async () => {
       const ids = new Set([...$("subscription-choices").querySelectorAll("input:checked")].map((input) => input.value));
-      const subscriptions = state.subscriptions.filter((sub) => ids.has(sub.id))
+      const tenant = $("tenant-select").value;
+      const subscriptions = state.subscriptions.filter((sub) => sub.tenant_id === tenant && ids.has(sub.id))
         .map((sub) => ({ id: sub.id, name: sub.name }));
-      if (!$("tenant-select").value || !subscriptions.length) throw new Error("Select a tenant and at least one enabled subscription.");
-      const config = await api("/api/config", {
-        tenant_id: $("tenant-select").value, subscriptions,
-        morning_time: $("schedule-time").value || "07:00",
-      });
-      renderConfig(config.config || config);
+      const profile = $("profile-directory").value.trim();
+      if (profile !== collectionProfile(state.config, tenant) &&
+          profile !== state.discoveredProfiles.get(tenant)) {
+        throw new Error("Discover this tenant's subscriptions using the selected Azure CLI profile first.");
+      }
+      const payload = collectionPayload(
+        state.config, tenant, subscriptions, profile, $("schedule-time").value,
+      );
+      const config = await api("/api/config", payload);
+      state.discoveredProfiles.delete(tenant);
+      renderConfig(config.config || config, tenant);
       applyStatus(await api("/api/status"));
-      toast("Collection scope saved locally.");
+      toast("Tenant scope saved locally. Collect now to refresh the full estate.");
     })();
   });
   $("schedule-form").addEventListener("submit", (event) => {
@@ -1362,12 +1590,17 @@ function wireEvents() {
     })();
   });
   document.addEventListener("visibilitychange", () => { if (!document.hidden) pollStatus(); });
+  window.addEventListener("resize", () => {
+    cancelAnimationFrame(railFrame);
+    railFrame = requestAnimationFrame(syncRailGutter);
+  });
   document.addEventListener("keydown", (event) => {
     if (event.key === "Escape" && !closeMultiSelects(true)) closeDetail();
   });
 }
 
 async function boot() {
+  restoreRailWidth();
   for (const key of multiKeys) {
     controls.set(key, new MultiSelect($(`filter-${key}`), {
       label: key === "family" ? "Model family" : key === "deployment_type" ? "Deployment geography" :

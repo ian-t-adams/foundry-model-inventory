@@ -179,6 +179,35 @@ export class MultiSelect {
   }
 }
 
+// Lays out every choice in a hidden copy of the control to find the width that keeps each
+// label on one line, both as the collapsed selection and inside the option list.
+export function measureChoices(choices) {
+  const probe = node("div", "multi-probe");
+  probe.setAttribute("aria-hidden", "true");
+  probe.inert = true;
+  const selection = node("span", "multi-selection");
+  const list = node("div", "multi-options");
+  for (const { label, description } of choices) {
+    selection.append(node("span", "", label));
+    const checkbox = node("input");
+    checkbox.type = "checkbox";
+    const text = node("span", "multi-option-label", label);
+    if (description) text.append(node("small", "multi-option-description", description));
+    const option = node("label", "multi-option");
+    option.append(checkbox, text);
+    list.append(option);
+  }
+  const trigger = node("div", "multi-trigger");
+  trigger.append(selection, node("span", "multi-arrow", "⌄"));
+  const panel = node("div", "multi-panel");
+  panel.append(list);
+  probe.append(trigger, panel);
+  document.body.append(probe);
+  const width = probe.getBoundingClientRect().width;
+  probe.remove();
+  return Math.ceil(width);
+}
+
 export function closeMultiSelects(returnFocus = false) {
   let closed = false;
   for (const instance of instances) {

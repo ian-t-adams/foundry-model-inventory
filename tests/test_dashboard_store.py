@@ -583,6 +583,24 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(len(self.rows(subscription="Development")), 3)
         self.assertEqual(self.rows(minimum="8"), [])
 
+    def test_tenant_filter_and_facets_keep_scopes_separate(self):
+        rows = [
+            report_row(Model="gpt-example", SubscriptionId="sub-a", TenantId="tenant-a"),
+            report_row(Model="claude-example", Subscription="Other subscription",
+                       SubscriptionId="sub-b", TenantId="tenant-b", Kind="AIServices",
+                       Format="Anthropic", QuotaName="other-pool"),
+        ]
+        self.ingest(rows, expected=["sub-a", "sub-b"])
+        self.assertEqual(self.store.facets()["tenant"], ["tenant-a", "tenant-b"])
+        self.assertEqual([row["model"] for row in self.rows(tenant="tenant-b")], ["claude-example"])
+        self.assertEqual(self.store.inventory({"tenant": "tenant-b"})["summary"]["subscriptions"], 1)
+        self.assertEqual(self.store.quota({"tenant": "tenant-b"})["total"], 1)
+        self.assertEqual(self.rows(tenant=["tenant-a", "tenant-b"], model="claude-example")[0]["tenant_id"], "tenant-b")
+        export = self.store.export_csv({"tenant": "tenant-b"})
+        self.assertIn("claude-example", export)
+        self.assertNotIn("gpt-example", export)
+        self.assertEqual(self.rows(tenant="tenant-c"), [])
+
     def test_search_wildcards_are_literals_and_sql_injection_is_data(self):
         malicious = "x' OR 1=1 --"
         self.ingest([

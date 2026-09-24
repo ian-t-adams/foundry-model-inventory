@@ -25,11 +25,14 @@ def parser() -> argparse.ArgumentParser:
         ("import", "Import existing inventory CSV files as one historical snapshot"),
         ("configure", "Select the tenant and subscriptions to collect"),
         ("schedule", "Manage the daily Windows collection task"),
+        ("hosted", "Serve the read-only dashboard behind App Service authentication and collect daily"),
     ]:
         command = commands.add_parser(name, help=description)
         command.add_argument("--data-dir", type=Path, default=ROOT / "data")
         if name == "serve":
             command.add_argument("--port", type=int, default=8765)
+        elif name == "hosted":
+            command.add_argument("--port", type=int, default=8000)
         elif name == "collect":
             command.add_argument("--source", choices=["manual", "scheduled"], default="manual")
         elif name == "import":
@@ -38,7 +41,13 @@ def parser() -> argparse.ArgumentParser:
         elif name == "configure":
             command.add_argument("--tenant-id", required=True)
             command.add_argument("--subscription-id", nargs="+", required=True)
-            command.add_argument("--morning-time", default="07:00")
+            command.add_argument("--morning-time")
+            command.add_argument(
+                "--azure-config-dir", type=Path,
+                help="Existing private Azure CLI profile directory under this checkout's data directory",
+            )
+            command.add_argument("--add", action="store_true",
+                                 help="Add subscriptions without replacing the configured estate")
         elif name == "schedule":
             action = command.add_mutually_exclusive_group()
             action.add_argument("--enable", action="store_true")
@@ -71,8 +80,13 @@ def main(argv: list[str] | None = None) -> int:
     store = None
     try:
         data_dir = resolve_data_dir(ROOT, args.data_dir)
-        if args.command == "serve" and not 1024 <= args.port <= 65535:
+        if args.command in ("serve", "hosted") and not 1024 <= args.port <= 65535:
             raise ValueError("Choose a port between 1024 and 65535.")
+        if args.command == "hosted":
+            from .hosted import run
+
+            # Hosted mode restores its database before opening it, so it owns the store.
+            return run(ROOT, data_dir, port=args.port)
         store = Store(data_dir / "inventory.sqlite3")
         collector = Collector(store, ROOT, data_dir)
         if args.command == "serve":
@@ -88,7 +102,16 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "collect":
             summary = collector.run_scan(source=args.source)
         elif args.command == "configure":
-            subscriptions = collector.discover_subscriptions()
+            profile = str(args.azure_config_dir.resolve()) if args.azure_config_dir is not None else None
+            if args.add and profile is None:
+                raise ValueError("--add requires --azure-config-dir for the tenant being added.")
+            previous = collector.load_config() if args.add else None
+            if args.add and not previous["subscriptions"]:
+                raise ValueError("Configure a primary tenant before adding another tenant.")
+            subscriptions = (
+                collector.discover_subscriptions(profile) if profile is not None
+                else collector.discover_subscriptions()
+            )
             requested = {item.lower() for item in args.subscription_id}
             selected = [
                 {"id": item["id"], "name": item["name"]}
@@ -99,8 +122,43 @@ def main(argv: list[str] | None = None) -> int:
             ]
             if len(selected) != len(requested):
                 raise ValueError("One or more subscriptions are unavailable, disabled, or belong to another tenant.")
-            summary = collector.save_config(
-                {"tenant_id": args.tenant_id, "subscriptions": selected, "morning_time": args.morning_time}
+            if args.add:
+                if args.morning_time and args.morning_time != previous["morning_time"]:
+                    raise ValueError("Change the morning collection time with the schedule command.")
+                config = dict(previous)
+                primary = previous["tenant_id"]
+                target = args.tenant_id.lower()
+                existing = {item["id"]: item for item in previous["subscriptions"]}
+                if target == primary:
+                    if profile != previous.get("azure_config_dir"):
+                        raise ValueError("Adding to the primary tenant requires its configured Azure CLI profile.")
+                else:
+                    existing_profile = previous.get("tenant_profiles", {}).get(target)
+                    if existing_profile and profile != existing_profile:
+                        raise ValueError(
+                            "Adding subscriptions cannot change an existing tenant's Azure CLI profile."
+                        )
+                    config["tenant_profiles"] = {
+                        **previous.get("tenant_profiles", {}), target: profile,
+                    }
+                for item in selected:
+                    old = existing.get(item["id"])
+                    if old and old.get("tenant_id", primary) != target:
+                        raise ValueError("A subscription cannot be moved to another tenant.")
+                    existing[item["id"]] = (
+                        item if target == primary else {**item, "tenant_id": target}
+                    )
+                config["subscriptions"] = list(existing.values())
+            else:
+                config = {
+                    "tenant_id": args.tenant_id, "subscriptions": selected,
+                    "morning_time": args.morning_time or "07:00",
+                }
+                if profile is not None:
+                    config["azure_config_dir"] = profile
+            summary = (
+                collector.save_config(config, expected_config=previous)
+                if args.add else collector.save_config(config)
             )
         else:
             summary = (

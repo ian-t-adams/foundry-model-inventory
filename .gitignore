@@ -16,6 +16,8 @@ data/
 __pycache__/
 *.py[cod]
 .pytest_cache/
+launcher/bin/
+launcher/obj/
 
 # Credentials, CLI state, and local configuration.
 .azure/
