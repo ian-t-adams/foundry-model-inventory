@@ -15,8 +15,8 @@ param inventoryScope string
 @description('Image currently deployed; empty before the first deployment from main.')
 param containerImage string
 
-@description('GitHub repository (owner/name) whose branch may deploy.')
-param githubRepository string
+@description('OIDC subject prefix GitHub presents for the deploying repository: repo:<owner>@<owner-id>/<repo>@<repo-id> with immutable subject claims, otherwise repo:<owner>/<repo>.')
+param githubSubjectPrefix string
 
 @description('Branch allowed to deploy.')
 param githubBranch string
@@ -200,7 +200,7 @@ resource githubFederation 'Microsoft.ManagedIdentity/userAssignedIdentities/fede
   name: 'github-${githubBranch}'
   properties: {
     issuer: 'https://token.actions.githubusercontent.com'
-    subject: 'repo:${githubRepository}:ref:refs/heads/${githubBranch}'
+    subject: '${githubSubjectPrefix}:ref:refs/heads/${githubBranch}'
     audiences: [
       'api://AzureADTokenExchange'
     ]

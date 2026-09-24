@@ -348,17 +348,22 @@ If registry storage approaches 10 GB, delete old `foundry-inventory` tags.
 | Deploy identity, user-assigned | Website Contributor | The web app |
 
 No person receives a new role. The deploy identity's federated credential trusts
-only `repo:<owner>/<repo>:ref:refs/heads/main` from
+only runs on `main` of this repository, from
 `https://token.actions.githubusercontent.com`, so pull requests and other
-branches cannot deploy.
+branches cannot deploy. Its subject is the one GitHub presents for that branch:
+`repo:<owner>@<owner-id>/<repo>@<repo-id>:ref:refs/heads/main` when the
+repository uses immutable subject claims (the default for repositories created
+since July 2026), otherwise `repo:<owner>/<repo>:ref:refs/heads/main`. The
+script reads it from the repository's OIDC settings.
 
 ### Deploy
 
 You need rights to create resources and role assignments (for example Owner) on
 the hosting and collected subscriptions, permission to register applications in
 Entra, a dedicated Azure CLI profile that is already signed in, and `gh` signed
-in with rights to set repository secrets. The script never signs in, signs out
-or changes the default subscription, and refuses the default `~/.azure` profile.
+in to read the repository's OIDC settings and, with `-SetGitHubSecrets`, set its
+secrets. The script never signs in, signs out or changes the default
+subscription, and refuses the default `~/.azure` profile.
 
 ```powershell
 .\scripts\deploy-hosted.ps1 -AzureConfigDir .\data\azure-cli `
@@ -397,6 +402,9 @@ requests run the tests and the image smoke test without secrets.
 - **Scope, schedule or infrastructure:** edit the local config or pass
   parameters, then run the script again. It is idempotent and keeps the image
   the workflow last deployed. The web app restarts with the new settings.
+- **Repository rename, transfer or OIDC subject change:** run the script again
+  so the federated credential matches the subject GitHub now presents. Until
+  then, the deploy job fails at Azure sign-in with `AADSTS700213`.
 - **Collect sooner:** collection runs daily at the configured local time. On
   start, the service also collects when no complete snapshot exists since the
   most recent scheduled time, so a restart retries a missed or failed collection.

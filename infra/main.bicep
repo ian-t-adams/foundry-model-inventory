@@ -23,8 +23,8 @@ param readerSubscriptionIds array
 @description('Image currently deployed, for example <registry>.azurecr.io/foundry-inventory:<commit>; empty before the first deployment from main.')
 param containerImage string = ''
 
-@description('GitHub repository (owner/name) whose main branch may deploy.')
-param githubRepository string
+@description('OIDC subject prefix GitHub presents for the repository whose main branch may deploy: repo:<owner>@<owner-id>/<repo>@<repo-id> with immutable subject claims (the default for new repositories), otherwise repo:<owner>/<repo>.')
+param githubSubjectPrefix string
 
 @description('Branch allowed to deploy through the federated credential.')
 param githubBranch string = 'main'
@@ -54,7 +54,7 @@ module app 'modules/app.bicep' = {
     authClientId: authClientId
     inventoryScope: inventoryScope
     containerImage: containerImage
-    githubRepository: githubRepository
+    githubSubjectPrefix: githubSubjectPrefix
     githubBranch: githubBranch
     timeZone: timeZone
     tags: tags
